@@ -376,13 +376,14 @@ long apfs_own_tree(const char *root, uid_t uid, gid_t gid) {
 long apfs_own_tree_kernel(const char *root, uid_t uid, gid_t gid) {
     NSLog(@"[APFS] own_tree_kernel: walking %s via vnode name cache (kernel mode)", root);
 
-    uint64_t root_vnode = get_vnode_for_path_by_chdir(root);
+    // Use get_vnode_for_path_kernel which bypasses DAC by walking the
+    // kernel name cache from root, with fallback to parent+name-cache.
+    // This succeeds where get_vnode_for_path_by_chdir/open fail on
+    // DAC-restricted paths like /var/mobile/Library/CarrierBundles.
+    uint64_t root_vnode = get_vnode_for_path_kernel(root);
     if (root_vnode == (uint64_t)-1 || !root_vnode) {
-        root_vnode = get_vnode_for_path_by_open(root);
-        if (root_vnode == (uint64_t)-1 || !root_vnode) {
-            NSLog(@"[APFS] own_tree_kernel: cannot get root vnode for %s", root);
-            return -1;
-        }
+        NSLog(@"[APFS] own_tree_kernel: cannot get root vnode for %s (all strategies failed)", root);
+        return -1;
     }
 
     long processed = 0;

