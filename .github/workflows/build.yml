@@ -51,10 +51,11 @@ jobs:
       - name: Download Filza IPA
         run: |
           URLS=(
-            "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.0.ipa"
-            "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.2.ipa"
-            "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.3.ipa"
-            "https://www.tigisoftware.com/default/data/File%20Manager/Filza_3.9.4.ipa"
+            "https://www.tigisoftware.com/download/Filza_4.0.0.ipa"
+            "https://www.tigisoftware.com/download/Filza_NoURLScheme_4.0.0.ipa"
+            "https://www.tigisoftware.com/download/Filza_NoURLScheme_4.0.2.ipa"
+            "https://www.tigisoftware.com/download/Filza_3.9.8.ipa"
+            "https://www.tigisoftware.com/download/Filza_NoURLScheme_3.9.8.ipa"
           )
           for url in "${URLS[@]}"; do
             echo "Trying: $url"
@@ -91,7 +92,7 @@ jobs:
           ldid -S /tmp/entitlements.plist "$APP_PATH/FilzaApplySandboxExt.dylib" 2>/dev/null || \
           ldid -S "$APP_PATH/FilzaApplySandboxExt.dylib"
 
-          find "$APP_PATH" -type f -perm +111 | while read f; do
+          find "$APP_PATH" -type f -perm /111 | while read f; do
             ldid -S /tmp/entitlements.plist "$f" 2>/dev/null || true
           done
 
