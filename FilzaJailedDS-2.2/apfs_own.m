@@ -26,6 +26,10 @@
 #include "kexploit/xpaci.h"
 #include "kexploit/vnode.h"
 
+// UF_IMMUTABLE = 0x00000001 — BSD-level immutable flag, blocks writes even
+// when uid/gid/mode would otherwise permit them.
+#define APFS_UF_IMMUTABLE 0x00000001
+
 // Primary: open()-based. Needs read permission on the target, so it can
 // hit EACCES on root-owned 0600/0700 files that our sandbox escape doesn't
 // bypass (sandbox clears MAC, not DAC).
@@ -156,11 +160,6 @@ int apfs_own(const char *path, uid_t uid, gid_t gid) {
 // accessible.  Uses additive mode (current_mode | 0600) instead of absolute
 // (0777) to avoid corrupting adjacent struct fields if the layout is wrong.
 // Returns 0 on success (readback matched), -1 on failure.
-// UF_IMMUTABLE = 0x00000001 — BSD-level immutable flag.
-// When set on an apfs_fsnode, the filesystem driver rejects writes even if
-// uid/gid/mode would otherwise permit them.  Always clear this on every
-// file we chown to ensure writes actually work.
-#define APFS_UF_IMMUTABLE 0x00000001
 
 static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
                            uint32_t *out_before_uid) {
