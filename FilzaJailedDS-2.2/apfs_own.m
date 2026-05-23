@@ -124,6 +124,16 @@ int apfs_own(const char *path, uid_t uid, gid_t gid) {
     kwrite32(fs_node + offsetof(struct apfs_fsnode, uid), uid);
     kwrite32(fs_node + offsetof(struct apfs_fsnode, gid), gid);
 
+    // Clear BSD immutable and APFS protection flags
+    uint32_t cur_bsd = kread32(fs_node + offsetof(struct apfs_fsnode, bsd_flags));
+    if (cur_bsd & APFS_UF_IMMUTABLE) {
+        kwrite32(fs_node + offsetof(struct apfs_fsnode, bsd_flags), cur_bsd & ~APFS_UF_IMMUTABLE);
+    }
+    uint32_t cur_ino_ext = kread32(fs_node + offsetof(struct apfs_fsnode, ino_flags_ext));
+    if (cur_ino_ext != 0) {
+        kwrite32(fs_node + offsetof(struct apfs_fsnode, ino_flags_ext), 0);
+    }
+
     sync(); sync(); sync();
 
     struct stat st;
@@ -146,6 +156,12 @@ int apfs_own(const char *path, uid_t uid, gid_t gid) {
 // accessible.  Uses additive mode (current_mode | 0600) instead of absolute
 // (0777) to avoid corrupting adjacent struct fields if the layout is wrong.
 // Returns 0 on success (readback matched), -1 on failure.
+// UF_IMMUTABLE = 0x00000001 — BSD-level immutable flag.
+// When set on an apfs_fsnode, the filesystem driver rejects writes even if
+// uid/gid/mode would otherwise permit them.  Always clear this on every
+// file we chown to ensure writes actually work.
+#define APFS_UF_IMMUTABLE 0x00000001
+
 static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
                            uint32_t *out_before_uid) {
     uint64_t fs_node = get_fsnode(path);
@@ -159,6 +175,18 @@ static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
 
     uint16_t cur_mode = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
     kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), cur_mode | 0600);
+
+    // Clear BSD immutable flags that would block writes regardless of DAC
+    uint32_t cur_bsd = kread32(fs_node + offsetof(struct apfs_fsnode, bsd_flags));
+    if (cur_bsd & APFS_UF_IMMUTABLE) {
+        kwrite32(fs_node + offsetof(struct apfs_fsnode, bsd_flags), cur_bsd & ~APFS_UF_IMMUTABLE);
+    }
+
+    // Clear APFS-level protection flags in ino_flags_ext
+    uint32_t cur_ino_ext = kread32(fs_node + offsetof(struct apfs_fsnode, ino_flags_ext));
+    if (cur_ino_ext != 0) {
+        kwrite32(fs_node + offsetof(struct apfs_fsnode, ino_flags_ext), 0);
+    }
 
     uint32_t after = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
     if (after != uid) return -1;
@@ -180,6 +208,18 @@ static int apfs_own_unsafe_vnode(uint64_t vnode, uid_t uid, gid_t gid) {
 
     uint16_t cur_mode = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
     kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), cur_mode | 0600);
+
+    // Clear BSD immutable flags
+    uint32_t cur_bsd = kread32(fs_node + offsetof(struct apfs_fsnode, bsd_flags));
+    if (cur_bsd & APFS_UF_IMMUTABLE) {
+        kwrite32(fs_node + offsetof(struct apfs_fsnode, bsd_flags), cur_bsd & ~APFS_UF_IMMUTABLE);
+    }
+
+    // Clear APFS-level protection flags
+    uint32_t cur_ino_ext = kread32(fs_node + offsetof(struct apfs_fsnode, ino_flags_ext));
+    if (cur_ino_ext != 0) {
+        kwrite32(fs_node + offsetof(struct apfs_fsnode, ino_flags_ext), 0);
+    }
 
     uint32_t after = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
     if (after != uid) return -1;

