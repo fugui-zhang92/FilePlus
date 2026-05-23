@@ -631,10 +631,11 @@ static void runExploit(void) {
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
 
     if (sret != 0) {
-        NSLog(@"[Tweak] sandbox escape failed, trying elevation without full escape...");
+        NSLog(@"[Tweak] sandbox escape failed, proceeding with apfs_own fallback...");
     }
 
-    NSLog(@"[Tweak] Attempting UID elevation to root via ucred swap...");
+    // sandbox_elevate_to_root is disabled on iOS 17+ (ucred in PPL read-only zone)
+    // sandbox_escape + apfs_own are sufficient for CarrierBundles access
     int rret = sandbox_elevate_to_root(self_proc_addr);
     NSLog(@"[Tweak] sandbox_elevate_to_root returned %d, getuid()=%d", rret, getuid());
 

