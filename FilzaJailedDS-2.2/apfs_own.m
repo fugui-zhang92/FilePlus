@@ -220,8 +220,9 @@ int apfs_own(const char *path, uid_t uid, gid_t gid) {
 }
 
 // Fast path: skip per-entry sync/stat verify. Used by the bulk tree walker.
-// Also writes mode=0777 so the entry becomes fully accessible regardless of
-// its original permissions (fixes "read only, can't modify" issue).
+// Also ensures owner read+write (0600) is set on every entry so it becomes
+// accessible.  Uses additive mode (current_mode | 0600) instead of absolute
+// (0777) to avoid corrupting adjacent struct fields if the layout is wrong.
 // Returns 0 on success (readback matched), -1 on failure.
 static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
                            uint32_t *out_before_uid) {
@@ -233,15 +234,15 @@ static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
 
     kwrite32(fs_node + offsetof(struct apfs_fsnode, uid), uid);
     kwrite32(fs_node + offsetof(struct apfs_fsnode, gid), gid);
-    kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), 0777);
 
-    // Kernel-side read-back: if the write didn't take, we haven't changed
-    // anything and the caller should count this as a failure.
+    uint16_t cur_mode = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
+    kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), cur_mode | 0600);
+
     uint32_t after = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
     if (after != uid) return -1;
 
     uint16_t mode_after = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
-    if (mode_after != 0777) return -1;
+    if ((mode_after & 0600) != 0600) return -1;
     return 0;
 }
 
@@ -254,18 +255,20 @@ static int apfs_own_unsafe_vnode(uint64_t vnode, uid_t uid, gid_t gid) {
 
     kwrite32(fs_node + offsetof(struct apfs_fsnode, uid), uid);
     kwrite32(fs_node + offsetof(struct apfs_fsnode, gid), gid);
-    kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), 0777);
+
+    uint16_t cur_mode = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
+    kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), cur_mode | 0600);
 
     uint32_t after = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
     if (after != uid) return -1;
     uint16_t mode_after = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
-    if (mode_after != 0777) return -1;
+    if ((mode_after & 0600) != 0600) return -1;
     return 0;
 }
 
 // Public wrapper around apfs_own_unsafe_vnode.  Takes a vnode directly
 // (obtained via get_vnode_for_path_kernel or similar) and writes
-// uid/gid/mode=0777 to its apfs_fsnode in kernel memory.
+// uid/gid/mode (owner RW) to its apfs_fsnode in kernel memory.
 // Bypasses all DAC checks.  Returns 0 on success, -1 on failure.
 int apfs_own_vnode(uint64_t vnode, uid_t uid, gid_t gid) {
     return apfs_own_unsafe_vnode(vnode, uid, gid);
@@ -287,7 +290,7 @@ static long apfs_own_tree_vnode_kernel(uint64_t vnode, uid_t uid, gid_t gid,
         if (processed) (*processed)++;
         if (*processed <= 10) {
             char *name = vnode_get_v_name(self_vnode);
-            NSLog(@"[APFS] kernel-chown'd: %s (uid=%u gid=%u mode=0777)",
+            NSLog(@"[APFS] kernel-chown'd: %s (uid=%u gid=%u mode=ownerRW)",
                   name ? name : "?", uid, gid);
         }
     }
@@ -366,7 +369,7 @@ static long chown_walk(const char *path, uid_t uid, gid_t gid, int depth,
 }
 
 long apfs_own_tree(const char *root, uid_t uid, gid_t gid) {
-    NSLog(@"[APFS] own_tree: walking %s -> uid=%u gid=%u (userspace, sets mode=0777)", root, uid, gid);
+    NSLog(@"[APFS] own_tree: walking %s -> uid=%u gid=%u (userspace, adds owner RW)", root, uid, gid);
     long skipped_lstat = 0, skipped_chown = 0, skipped_opendir = 0;
     long n = chown_walk(root, uid, gid, 0,
                         &skipped_lstat, &skipped_chown, &skipped_opendir);
@@ -398,7 +401,7 @@ long apfs_own_tree_kernel(const char *root, uid_t uid, gid_t gid) {
 
     sync(); sync(); sync();
 
-    NSLog(@"[APFS] own_tree_kernel: processed %ld entries under %s (uid=%u gid=%u mode=0777)",
+    NSLog(@"[APFS] own_tree_kernel: processed %ld entries under %s (uid=%u gid=%u mode=ownerRW)",
           n, root, uid, gid);
     return n;
 }

@@ -660,8 +660,8 @@ static void runExploit(void) {
         // Uses get_vnode_for_path_kernel which bypasses DAC by walking the
         // kernel name cache (with /var -> /private/var symlink awareness).
         // This succeeds even on root-owned 0700 directories that chdir/open
-        // would reject.  Sets mode=0777, uid=501, gid=501 on the root dir
-        // and any children reachable via the name cache.
+        // would reject.  Sets uid=501, gid=501 on the root dir
+        // and adds owner RW bits (0600) to any children reachable via the name cache.
         long kn = apfs_own_tree_kernel(cbPath, 501, 501);
         NSLog(@"[Tweak] CarrierBundles initial kernel walk: %ld entries processed", kn);
 
@@ -673,8 +673,8 @@ static void runExploit(void) {
             if (stat(cbPath, &verifyStat) == 0) {
                 NSLog(@"[Tweak] CarrierBundles after kernel walk: uid=%u gid=%u mode=0%o",
                       verifyStat.st_uid, verifyStat.st_gid, verifyStat.st_mode & 0xFFFF);
-                if ((verifyStat.st_mode & 0777) != 0777) {
-                    NSLog(@"[Tweak] Root directory mode NOT 0777 after kernel walk, trying direct vnode write");
+                if ((verifyStat.st_mode & 0700) != 0700) {
+                    NSLog(@"[Tweak] Root directory owner lacks rwx after kernel walk, trying direct vnode write");
                     uint64_t rv = get_vnode_for_path_kernel(cbPath);
                     if (rv != (uint64_t)-1 && rv != 0) {
                         if (apfs_own_vnode(rv, 501, 501) == 0) {
@@ -691,7 +691,7 @@ static void runExploit(void) {
         }
 
         // Step 2: Force-populate the vnode name cache by opening the directory
-        // and reading all entries.  After Step 1 the root has mode=0777 so
+        // and reading all entries.  After Step 1 the root has owner rwx so
         // opendir/readdir works.  Each readdir() call populates the kernel's
         // name cache for the directory's children.
         {
@@ -718,7 +718,7 @@ static void runExploit(void) {
                 NSLog(@"[Tweak] CarrierBundles name cache populated via readdir");
             } else {
                 NSLog(@"[Tweak] Could not opendir %s after kernel takeover (errno=%d)", cbPath, errno);
-                // The kernel walk should have set mode=0777.  If opendir still
+                // The kernel walk should have set owner rwx.  If opendir still
                 // fails, something is wrong with the root directory.  Try to
                 // force-mode it again.
                 NSLog(@"[Tweak] Forcing root directory mode via kernel write");
@@ -735,12 +735,12 @@ static void runExploit(void) {
         }
 
         // Step 3: Kernel walk again — now the name cache has all children,
-        // so every file/dir inside CarrierBundles gets uid=501, gid=501, mode=0777.
+        // so every file/dir inside CarrierBundles gets uid=501, gid=501, owner RW.
         kn = apfs_own_tree_kernel(cbPath, 501, 501);
         NSLog(@"[Tweak] CarrierBundles second kernel walk: %ld entries processed", kn);
 
         // Step 4: Multi-pass userspace tree walk (chown + chmod every entry).
-        // After kernel steps 1-3, all entries should be 0777, so this is a
+        // After kernel steps 1-3, all entries should have owner RW, so this is a
         // verification pass that also catches any stragglers.
         long total = 0;
         for (int pass = 0; pass < 10; pass++) {
