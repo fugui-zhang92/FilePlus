@@ -5,6 +5,7 @@
 //  Created by seo on 3/26/26.
 //
 
+#include <stddef.h>
 #include "process.h"
 #include "../kexploit/kutils.h"
 #include "../kexploit/krw.h"
