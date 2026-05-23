@@ -1,0 +1,98 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: Filza IPA 下载地址（覆盖 GitHub Secret）
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install Theos
+      run: |
+        sudo mkdir -p /opt/theos
+        sudo chown $(whoami) /opt/theos
+        git clone --recursive --depth 1 https://github.com/theos/theos.git /opt/theos
+        echo "THEOS=/opt/theos" >> $GITHUB_ENV
+        echo "TARGET=iphone:clang:latest:15.0" >> $GITHUB_ENV
+
+    - name: Install ldid
+      run: |
+        git clone --depth 1 https://github.com/itsGato/ldid.git /tmp/ldid
+        cd /tmp/ldid
+        make -j$(sysctl -n hw.logicalcpu)
+        sudo cp ldid /usr/local/bin/
+
+    - name: Build Tweak (deb)
+      run: |
+        cd FilzaJailedDS-2.2
+        make package
+        echo "DEB_PATH=$(find packages -name '*.deb' | head -1)" >> $GITHUB_ENV
+
+    - name: Locate built dylib
+      id: dylib
+      run: |
+        DYLIB=$(find FilzaJailedDS-2.2/.theos -name '*.dylib' | head -1)
+        echo "DYLIB_PATH=$DYLIB" >> $GITHUB_ENV
+        echo "path=$DYLIB" >> "$GITHUB_OUTPUT"
+
+    - name: Upload .deb Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: FilzaApplySandboxExt.deb
+        path: FilzaJailedDS-2.2/packages/*.deb
+
+    - name: Download Filza IPA
+      if: ${{ secrets.IPA_DOWNLOAD_URL != '' || github.event.inputs.ipa_url != '' }}
+      env:
+        IPA_URL: ${{ github.event.inputs.ipa_url || secrets.IPA_DOWNLOAD_URL }}
+      run: |
+        curl -L -o /tmp/Filza.ipa "$IPA_URL"
+        echo "IPA_DOWNLOADED=true" >> $GITHUB_ENV
+
+    - name: Inject Dylib into IPA
+      if: env.IPA_DOWNLOADED == 'true'
+      run: |
+        mkdir -p /tmp/FilzaApp
+        cd /tmp/FilzaApp
+        unzip -q /tmp/Filza.ipa
+        APP_PATH=$(find Payload -name '*.app' -type d | head -1)
+        echo "App bundle: $APP_PATH"
+
+        cp "${{ env.DYLIB_PATH }}" "$APP_PATH/"
+        cp ${{ github.workspace }}/FilzaJailedDS-2.2/FilzaApplySandboxExt.plist "$APP_PATH/"
+        install_name_tool -change /Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
+          @executable_path/FilzaApplySandboxExt.dylib \
+          "$APP_PATH/FilzaApplySandboxExt.dylib" || true
+        ldid -S "$APP_PATH/FilzaApplySandboxExt.dylib"
+
+        cd /tmp/FilzaApp
+        zip -qr ${{ github.workspace }}/FilzaPatched.ipa Payload/
+        echo "IPA_PATH=${{ github.workspace }}/FilzaPatched.ipa" >> $GITHUB_ENV
+
+    - name: Upload .ipa Artifact
+      if: env.IPA_DOWNLOADED == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: FilzaPatched.ipa
+        path: ${{ env.IPA_PATH }}
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          FilzaJailedDS-2.2/packages/*.deb
+        generate_release_notes: true
