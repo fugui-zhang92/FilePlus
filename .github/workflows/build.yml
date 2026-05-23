@@ -37,9 +37,10 @@ jobs:
         run: |
           cd FilzaJailedDS-2.2
           make package
-          echo "DEB_PATH=$(find packages -name '*.deb' | head -1)" >> $GITHUB_ENV
+          DEB=$(find packages -name '*.deb' | head -1)
+          echo "DEB_PATH=$(pwd)/$DEB" >> $GITHUB_ENV
           DYLIB=$(find .theos/obj -name '*.dylib' | head -1)
-          echo "DYLIB_PATH=$DYLIB" >> $GITHUB_ENV
+          echo "DYLIB_PATH=$(pwd)/$DYLIB" >> $GITHUB_ENV
 
       - name: Upload .deb
         uses: actions/upload-artifact@v4
