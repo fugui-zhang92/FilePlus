@@ -1,3 +1,4 @@
+#include <dirent.h>
 @import UIKit;
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -636,7 +637,7 @@ static void runExploit(void) {
     int rret = sandbox_elevate_to_root(self_proc_addr);
     NSLog(@"[Tweak] sandbox_elevate_to_root returned %d, getuid()=%d", rret, getuid());
 
-    const char *cbPath = "/var/mobile/Library/CarrierBundles";
+    const char *cbPath = "/var/mobile/Library/Carrier Bundles";
     struct stat cbStat;
 
     if (getuid() == 0) {
