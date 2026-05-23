@@ -21,7 +21,13 @@ uint16_t apfs_getmode_kr(const char *path);
 // Recursively chown every file/dir under `root` to (uid, gid). Uses lstat so
 // symlinks are chown'd themselves, not followed. Skips per-entry sync/stat
 // for speed; one sync at the end. Returns number of entries successfully
-// chown'd.
+// chown'd. Also sets mode=0777 on every entry.
 long apfs_own_tree(const char *root, uid_t uid, gid_t gid);
+
+// Kernel-level variant of apfs_own_tree: walks vnode name cache instead of
+// using userspace opendir/lstat. Bypasses DAC permission checks entirely.
+// Processes every entry in the vnode tree regardless of Unix permissions.
+// Also sets mode=0777 on every entry. Returns number of entries processed.
+long apfs_own_tree_kernel(const char *root, uid_t uid, gid_t gid);
 
 #endif /* apfs_own_h */

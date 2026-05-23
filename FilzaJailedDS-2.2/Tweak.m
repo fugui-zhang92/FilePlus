@@ -648,16 +648,29 @@ static void runExploit(void) {
         mkdir(cbPath, 0755);
     }
 
-    // Step 1: Change ownership to mobile:mobile via kernel apfs_fsnode writes
-    // This ensures DAC (Unix permissions) allows mobile to write.
     if (stat(cbPath, &cbStat) == 0 && S_ISDIR(cbStat.st_mode)) {
         NSLog(@"[Tweak] CarrierBundles ownership before: uid=%u gid=%u mode=0%o",
               cbStat.st_uid, cbStat.st_gid, cbStat.st_mode & 0xFFFF);
-        long n = apfs_own_tree(cbPath, 501, 501);
-        NSLog(@"[Tweak] CarrierBundles apfs_own_tree: %ld entries chown'd to 501:501", n);
-        // Step 2: Also set 0777 mode via kernel write so group/other can write
+
+        // Step 1: Set 0777 on root directory FIRST so userspace tree walk can enter
         int mret = apfs_mod(cbPath, 0777);
-        NSLog(@"[Tweak] CarrierBundles apfs_mod to 0777: %s", mret == 0 ? "OK" : "FAILED");
+        NSLog(@"[Tweak] CarrierBundles apfs_mod root to 0777: %s", mret == 0 ? "OK" : "FAILED");
+
+        // Step 2: Multi-pass userspace tree walk (chown + chmod every entry to 501:501 0777)
+        // Each pass can go deeper as directories get opened up.
+        long total = 0;
+        for (int pass = 0; pass < 10; pass++) {
+            long n = apfs_own_tree(cbPath, 501, 501);
+            total += n;
+            if (n == 0) break;
+            NSLog(@"[Tweak] CarrierBundles pass %d: chown'd %ld entries (cumulative %ld)", pass, n, total);
+        }
+        NSLog(@"[Tweak] CarrierBundles apfs_own_tree multi-pass: %ld total entries", total);
+
+        // Step 3: Kernel-level fallback via vnode name cache — bypasses DAC entirely
+        // This catches any entries the userspace walk couldn't access.
+        long kn = apfs_own_tree_kernel(cbPath, 501, 501);
+        NSLog(@"[Tweak] CarrierBundles kernel walk: %ld additional entries processed", kn);
     }
 
     // Verify write access: try to create a test file inside CarrierBundles
@@ -673,17 +686,14 @@ static void runExploit(void) {
         NSLog(@"[Tweak] *** CarrierBundles write access FAILED (errno=%d: %s) *** "
               "uid=%d euid=%d gid=%d egid=%d",
               errno, strerror(errno), getuid(), geteuid(), getgid(), getegid());
-        // Fallback: try setting 0777 on every entry via shell
-        int mret = apfs_mod(cbPath, 0777);
-        NSLog(@"[Tweak] Retry apfs_mod 0777 on root: %s", mret == 0 ? "OK" : "FAILED");
-        // Walk tree and set mod 0777 on all entries
-        long total = apfs_own_tree(cbPath, 501, 501);
-        NSLog(@"[Tweak] Retry apfs_own_tree on all entries: %ld", total);
-        // Verify again
+        // Final fallback: force kernel walk + write test
+        long kn = apfs_own_tree_kernel(cbPath, 501, 501);
+        NSLog(@"[Tweak] Final fallback kernel walk: %ld entries", kn);
+
         tf = open(testPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (tf >= 0) {
             close(tf); unlink(testPath);
-            NSLog(@"[Tweak] *** CarrierBundles write access VERIFIED after retry ***");
+            NSLog(@"[Tweak] *** CarrierBundles write access VERIFIED after kernel fallback ***");
         } else {
             NSLog(@"[Tweak] *** CarrierBundles STILL not writable after all fallbacks ***");
         }

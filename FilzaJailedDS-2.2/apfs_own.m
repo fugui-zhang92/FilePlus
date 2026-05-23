@@ -220,6 +220,8 @@ int apfs_own(const char *path, uid_t uid, gid_t gid) {
 }
 
 // Fast path: skip per-entry sync/stat verify. Used by the bulk tree walker.
+// Also writes mode=0777 so the entry becomes fully accessible regardless of
+// its original permissions (fixes "read only, can't modify" issue).
 // Returns 0 on success (readback matched), -1 on failure.
 static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
                            uint32_t *out_before_uid) {
@@ -231,12 +233,74 @@ static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
 
     kwrite32(fs_node + offsetof(struct apfs_fsnode, uid), uid);
     kwrite32(fs_node + offsetof(struct apfs_fsnode, gid), gid);
+    kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), 0777);
 
     // Kernel-side read-back: if the write didn't take, we haven't changed
     // anything and the caller should count this as a failure.
     uint32_t after = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
     if (after != uid) return -1;
+
+    uint16_t mode_after = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
+    if (mode_after != 0777) return -1;
     return 0;
+}
+
+// Kernel-level variant: take a vnode directly (no path-based DAC needed).
+// Walks vnode → v_data (apfs_fsnode) and writes uid/gid/mode.
+static int apfs_own_unsafe_vnode(uint64_t vnode, uid_t uid, gid_t gid) {
+    if (!vnode || vnode == (uint64_t)-1) return -1;
+    uint64_t fs_node = kread64(vnode + off_vnode_v_data);
+    fs_node = xpaci(fs_node);
+    if (!fs_node) return -1;
+
+    kwrite32(fs_node + offsetof(struct apfs_fsnode, uid), uid);
+    kwrite32(fs_node + offsetof(struct apfs_fsnode, gid), gid);
+    kwrite16(fs_node + offsetof(struct apfs_fsnode, mode), 0777);
+
+    uint32_t after = kread32(fs_node + offsetof(struct apfs_fsnode, uid));
+    if (after != uid) return -1;
+    uint16_t mode_after = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
+    if (mode_after != 0777) return -1;
+    return 0;
+}
+
+// Recursive kernel-level walk via vnode name cache (bypasses DAC entirely).
+// Walks the vnode's ncchildren list, processes each child's fsnode, and
+// recurses into subdirectories. Returns number of entries processed.
+static long apfs_own_tree_vnode_kernel(uint64_t vnode, uid_t uid, gid_t gid,
+                                        int depth, long *processed) {
+    if (depth > 32 || !vnode || vnode == (uint64_t)-1) return 0;
+
+    uint64_t self_vnode = vnode;
+    long n = 0;
+
+    // Process current vnode
+    if (apfs_own_unsafe_vnode(self_vnode, uid, gid) == 0) {
+        n++;
+        if (processed) (*processed)++;
+        if (*processed <= 10) {
+            char *name = vnode_get_v_name(self_vnode);
+            NSLog(@"[APFS] kernel-chown'd: %s (uid=%u gid=%u mode=0777)",
+                  name ? name : "?", uid, gid);
+        }
+    }
+
+    // Walk vnode name cache children
+    uint64_t vp_namecache = kread64(self_vnode + off_vnode_v_ncchildren_tqh_first);
+    vp_namecache = xpaci(vp_namecache);
+
+    while (vp_namecache) {
+        uint64_t child_vnode = kread64(vp_namecache + off_namecache_nc_vp);
+        child_vnode = xpaci(child_vnode);
+        if (child_vnode && child_vnode != (uint64_t)-1) {
+            n += apfs_own_tree_vnode_kernel(child_vnode, uid, gid,
+                                             depth + 1, processed);
+        }
+        vp_namecache = kread64(vp_namecache + off_namecache_nc_child_tqe_next);
+        vp_namecache = xpaci(vp_namecache);
+    }
+
+    return n;
 }
 
 // Skip subtrees iOS validates by ownership — chown'ing these breaks codesign
@@ -295,7 +359,7 @@ static long chown_walk(const char *path, uid_t uid, gid_t gid, int depth,
 }
 
 long apfs_own_tree(const char *root, uid_t uid, gid_t gid) {
-    NSLog(@"[APFS] own_tree: walking %s -> uid=%u gid=%u", root, uid, gid);
+    NSLog(@"[APFS] own_tree: walking %s -> uid=%u gid=%u (userspace, sets mode=0777)", root, uid, gid);
     long skipped_lstat = 0, skipped_chown = 0, skipped_opendir = 0;
     long n = chown_walk(root, uid, gid, 0,
                         &skipped_lstat, &skipped_chown, &skipped_opendir);
@@ -303,6 +367,31 @@ long apfs_own_tree(const char *root, uid_t uid, gid_t gid) {
     NSLog(@"[APFS] own_tree: chown'd %ld entries under %s "
           "(skipped: lstat=%ld chown=%ld opendir=%ld)",
           n, root, skipped_lstat, skipped_chown, skipped_opendir);
+    return n;
+}
+
+// Kernel-level tree walk: uses vnode name cache to bypass DAC restrictions.
+// Processes every entry in the vnode tree regardless of Unix permissions.
+// Returns number of entries successfully chown'd + mod'd.
+long apfs_own_tree_kernel(const char *root, uid_t uid, gid_t gid) {
+    NSLog(@"[APFS] own_tree_kernel: walking %s via vnode name cache (kernel mode)", root);
+
+    uint64_t root_vnode = get_vnode_for_path_by_chdir(root);
+    if (root_vnode == (uint64_t)-1 || !root_vnode) {
+        root_vnode = get_vnode_for_path_by_open(root);
+        if (root_vnode == (uint64_t)-1 || !root_vnode) {
+            NSLog(@"[APFS] own_tree_kernel: cannot get root vnode for %s", root);
+            return -1;
+        }
+    }
+
+    long processed = 0;
+    long n = apfs_own_tree_vnode_kernel(root_vnode, uid, gid, 0, &processed);
+
+    sync(); sync(); sync();
+
+    NSLog(@"[APFS] own_tree_kernel: processed %ld entries under %s (uid=%u gid=%u mode=0777)",
+          n, root, uid, gid);
     return n;
 }
 
