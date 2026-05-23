@@ -36,7 +36,8 @@ jobs:
       - name: Build Tweak (.deb)
         run: |
           cd FilzaJailedDS-2.2
-          make package
+          make package VERBOSE=1 2>&1
+          echo "BUILD_EXIT_CODE=$?"
           DEB=$(find packages -name '*.deb' | head -1)
           echo "DEB_PATH=$(pwd)/$DEB" >> $GITHUB_ENV
           DYLIB=$(find .theos/obj -name '*.dylib' | head -1)
