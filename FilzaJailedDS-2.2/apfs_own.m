@@ -250,7 +250,6 @@ static int apfs_own_unsafe(const char *path, uid_t uid, gid_t gid,
 static int apfs_own_unsafe_vnode(uint64_t vnode, uid_t uid, gid_t gid) {
     if (!vnode || vnode == (uint64_t)-1) return -1;
     uint64_t fs_node = kread64(vnode + off_vnode_v_data);
-    fs_node = xpaci(fs_node);
     if (!fs_node) return -1;
 
     kwrite32(fs_node + offsetof(struct apfs_fsnode, uid), uid);
@@ -262,6 +261,14 @@ static int apfs_own_unsafe_vnode(uint64_t vnode, uid_t uid, gid_t gid) {
     uint16_t mode_after = kread16(fs_node + offsetof(struct apfs_fsnode, mode));
     if (mode_after != 0777) return -1;
     return 0;
+}
+
+// Public wrapper around apfs_own_unsafe_vnode.  Takes a vnode directly
+// (obtained via get_vnode_for_path_kernel or similar) and writes
+// uid/gid/mode=0777 to its apfs_fsnode in kernel memory.
+// Bypasses all DAC checks.  Returns 0 on success, -1 on failure.
+int apfs_own_vnode(uint64_t vnode, uid_t uid, gid_t gid) {
+    return apfs_own_unsafe_vnode(vnode, uid, gid);
 }
 
 // Recursive kernel-level walk via vnode name cache (bypasses DAC entirely).

