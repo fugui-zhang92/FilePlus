@@ -28,7 +28,7 @@ jobs:
           echo "TARGET=iphone:clang:latest:15.0" >> $GITHUB_ENV
 
           git clone --depth 1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
-          cd /tmp/insert_dylib
+          cd /tmp/insert_dylib/insert_dylib
           clang -O2 insert_dylib.c -o insert_dylib -framework CoreFoundation
           sudo cp insert_dylib /usr/local/bin/
           echo "insert_dylib: ok"
