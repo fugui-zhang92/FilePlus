@@ -2,133 +2,115 @@ name: Build IPA
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+    branches: [main, master]
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * 1'
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14
+    timeout-minutes: 30
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Install Dependencies (Theos + ldid + insert_dylib)
-      run: |
-        # Theos
-        sudo mkdir -p /opt/theos
-        sudo chown $(whoami) /opt/theos
-        git clone --recursive --depth 1 https://github.com/theos/theos.git /opt/theos
-        echo "THEOS=/opt/theos" >> $GITHUB_ENV
-        echo "TARGET=iphone:clang:latest:15.0" >> $GITHUB_ENV
+      - name: Install Dependencies
+        run: |
+          brew install ldid 2>/dev/null && echo "ldid: ok" || {
+            brew install procursus/tap/ldid 2>/dev/null && echo "ldid(procursus): ok" || echo "ldid: FAILED"
+          }
+          which ldid && ldid 2>&1 | head -1
 
-        # ldid
-        git clone --depth 1 https://github.com/itsGato/ldid.git /tmp/ldid
-        cd /tmp/ldid
-        make -j$(sysctl -n hw.logicalcpu)
-        sudo cp ldid /usr/local/bin/
+          sudo mkdir -p /opt/theos
+          sudo chown $(whoami) /opt/theos
+          git clone --recursive --depth 1 https://github.com/theos/theos.git /opt/theos
+          echo "THEOS=/opt/theos" >> $GITHUB_ENV
+          echo "TARGET=iphone:clang:latest:15.0" >> $GITHUB_ENV
 
-        # insert_dylib
-        git clone --depth 1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
-        cd /tmp/insert_dylib
-        clang -O2 insert_dylib.c -o insert_dylib -framework CoreFoundation
-        sudo cp insert_dylib /usr/local/bin/
+          git clone --depth 1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
+          cd /tmp/insert_dylib
+          clang -O2 insert_dylib.c -o insert_dylib -framework CoreFoundation
+          sudo cp insert_dylib /usr/local/bin/
+          echo "insert_dylib: ok"
 
-    - name: Build Tweak (.deb)
-      run: |
-        cd FilzaJailedDS-2.2
-        make package
-        echo "DEB_PATH=$(find packages -name '*.deb' | head -1)" >> $GITHUB_ENV
-        DYLIB=$(find .theos/obj -name '*.dylib' | head -1)
-        echo "DYLIB_PATH=$DYLIB" >> $GITHUB_ENV
+      - name: Build Tweak (.deb)
+        run: |
+          cd FilzaJailedDS-2.2
+          make package
+          echo "DEB_PATH=$(find packages -name '*.deb' | head -1)" >> $GITHUB_ENV
+          DYLIB=$(find .theos/obj -name '*.dylib' | head -1)
+          echo "DYLIB_PATH=$DYLIB" >> $GITHUB_ENV
 
-    - name: Upload .deb
-      uses: actions/upload-artifact@v4
-      with:
-        name: FilePlus-Tweak.deb
-        path: FilzaJailedDS-2.2/packages/*.deb
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: FilePlus-Tweak.deb
+          path: FilzaJailedDS-2.2/packages/*.deb
+          retention-days: 90
 
-    - name: Download Filza IPA
-      id: download_ipa
-      run: |
-        IPA_URL="https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.0.ipa"
-        FALLBACK_URLS=(
-          "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.0.ipa"
-          "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.2.ipa"
-          "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.3.ipa"
-          "https://www.tigisoftware.com/default/data/File%20Manager/Filza_3.9.4.ipa"
-        )
+      - name: Download Filza IPA
+        run: |
+          URLS=(
+            "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.0.ipa"
+            "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.2.ipa"
+            "https://www.tigisoftware.com/default/data/File%20Manager/Filza_4.0.3.ipa"
+            "https://www.tigisoftware.com/default/data/File%20Manager/Filza_3.9.4.ipa"
+          )
+          for url in "${URLS[@]}"; do
+            echo "Trying: $url"
+            HTTP_CODE=$(curl -L -o /tmp/Filza.ipa -w "%{http_code}" "$url" 2>/dev/null)
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "Downloaded successfully from: $url"
+              echo "IPA_READY=1" >> $GITHUB_ENV
+              exit 0
+            fi
+          done
+          echo "All download URLs failed, IPA will not be created" >> $GITHUB_STEP_SUMMARY
 
-        for url in "${FALLBACK_URLS[@]}"; do
-          echo "Trying: $url"
-          HTTP_CODE=$(curl -L -o /tmp/Filza.ipa -w "%{http_code}" "$url" 2>/dev/null)
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "Downloaded successfully from: $url"
-            echo "IPA_DOWNLOADED=true" >> $GITHUB_ENV
-            exit 0
-          fi
-        done
+      - name: Inject + Repack IPA
+        if: env.IPA_READY == '1'
+        run: |
+          mkdir -p /tmp/FilzaApp
+          cd /tmp/FilzaApp
+          unzip -q /tmp/Filza.ipa
+          APP_PATH=$(find Payload -name '*.app' -type d | head -1)
+          APP_BINARY=$(ls "$APP_PATH" | grep -v '\.' | head -1)
+          echo "App bundle: $APP_PATH"
+          echo "App binary: $APP_BINARY"
 
-        echo "All download URLs failed"
-        echo "IPA_DOWNLOADED=false" >> $GITHUB_ENV
-        return 1
+          cp "${{ env.DYLIB_PATH }}" "$APP_PATH/FilzaApplySandboxExt.dylib"
+          cp ${{ github.workspace }}/FilzaJailedDS-2.2/FilzaApplySandboxExt.plist "$APP_PATH/"
 
-    - name: Inject Dylib + Re-sign IPA
-      if: env.IPA_DOWNLOADED == 'true'
-      run: |
-        set -e
+          codesign -d --entitlements :- "$APP_PATH/$APP_BINARY" > /tmp/entitlements.plist 2>/dev/null || true
 
-        mkdir -p /tmp/FilzaApp
-        cd /tmp/FilzaApp
-        unzip -q /tmp/Filza.ipa
+          insert_dylib @executable_path/FilzaApplySandboxExt.dylib \
+            "$APP_PATH/$APP_BINARY" \
+            "$APP_PATH/$APP_BINARY" \
+            --all-yes --overwrite 2>/dev/null || true
 
-        APP_PATH=$(find Payload -name '*.app' -type d | head -1)
-        APP_BINARY=$(ls "$APP_PATH" | grep -v '\.' | head -1)
-        echo "App bundle: $APP_PATH"
-        echo "App binary: $APP_BINARY"
+          ldid -S /tmp/entitlements.plist "$APP_PATH/FilzaApplySandboxExt.dylib" 2>/dev/null || \
+          ldid -S "$APP_PATH/FilzaApplySandboxExt.dylib"
 
-        # Copy dylib + plist
-        cp "${{ env.DYLIB_PATH }}" "$APP_PATH/FilzaApplySandboxExt.dylib"
-        cp ${{ github.workspace }}/FilzaJailedDS-2.2/FilzaApplySandboxExt.plist "$APP_PATH/"
+          find "$APP_PATH" -type f -perm +111 | while read f; do
+            ldid -S /tmp/entitlements.plist "$f" 2>/dev/null || true
+          done
 
-        # Extract original entitlements
-        codesign -d --entitlements :- "$APP_PATH/$APP_BINARY" > /tmp/entitlements.plist 2>/dev/null || true
+          cd /tmp/FilzaApp
+          zip -qr ${{ github.workspace }}/FilePlus.ipa Payload/
+          ls -lh ${{ github.workspace }}/FilePlus.ipa
 
-        # Inject dylib load command into main binary
-        insert_dylib @executable_path/FilzaApplySandboxExt.dylib \
-          "$APP_PATH/$APP_BINARY" \
-          "$APP_PATH/$APP_BINARY" \
-          --all-yes --overwrite 2>/dev/null || true
+      - name: Upload .ipa
+        if: env.IPA_READY == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: FilePlus.ipa
+          path: ${{ github.workspace }}/FilePlus.ipa
+          retention-days: 90
 
-        # Sign the dylib
-        ldid -S /tmp/entitlements.plist "$APP_PATH/FilzaApplySandboxExt.dylib" 2>/dev/null || \
-        ldid -S "$APP_PATH/FilzaApplySandboxExt.dylib"
-
-        # Strip code signatures from all binaries (for sideload)
-        find "$APP_PATH" -type f -perm +111 | while read f; do
-          ldid -S /tmp/entitlements.plist "$f" 2>/dev/null || true
-        done
-
-        # Repack into IPA
-        cd /tmp/FilzaApp
-        zip -qr ${{ github.workspace }}/FilePlus.ipa Payload/
-        ls -lh ${{ github.workspace }}/FilePlus.ipa
-
-    - name: Upload .ipa
-      if: env.IPA_DOWNLOADED == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: FilePlus.ipa
-        path: ${{ github.workspace }}/FilePlus.ipa
-
-    - name: Create Release
-      if: startsWith(github.ref, 'refs/tags/v')
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          FilzaJailedDS-2.2/packages/*.deb
-        generate_release_notes: true
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            FilzaJailedDS-2.2/packages/*.deb
+          generate_release_notes: true
