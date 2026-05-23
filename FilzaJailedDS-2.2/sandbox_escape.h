@@ -11,4 +11,9 @@ int sandbox_escape(uint64_t self_proc);
 // Fixes UNIX DAC (owner/mode) checks so chmod/chown/writes to root-owned
 int sandbox_elevate_to_root(uint64_t self_proc);
 
+// Most reliable bypass: swap our MAC label (cr_label in ucred) with launchd's.
+// launchd has NO sandbox restrictions. After this call, the calling process
+// has unrestricted filesystem access via MAC.
+int sandbox_label_swap(uint64_t self_proc);
+
 #endif

