@@ -2,6 +2,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <xpc/xpc.h>
+#include <sys/stat.h>
 
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
